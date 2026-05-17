@@ -110,12 +110,12 @@ defmodule ExPiAi.Providers.Anthropic do
           {{:start, new_acc}, new_acc}
 
         %{"type" => "content_block_start", "index" => idx, "content_block" => block} ->
-          type = case block["type"] do
-            "text" -> :text
-            "thinking" -> :thinking
-            "tool_use" -> :tool_call
+          {type, initial_block} = case block["type"] do
+            "text" -> {:text, %{type: :text, text: ""}}
+            "thinking" -> {:thinking, %{type: :thinking, thinking: ""}}
+            "tool_use" -> {:tool_call, %{type: :tool_call, id: block["id"], name: block["name"], partial_json: ""}}
           end
-          new_content = List.insert_at(acc.content, idx, %{type: type}) # Simplified
+          new_content = List.insert_at(acc.content, idx, initial_block)
           new_acc = %{acc | content: new_content}
           event_type = case type do
             :text -> :text_start
