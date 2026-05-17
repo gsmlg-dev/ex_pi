@@ -1,3 +1,13 @@
+<.dm_appbar title="ExPi" sticky>
+  <:logo>
+    <div class="font-display text-2xl font-bold tracking-tight text-primary-content">π</div>
+  </:logo>
+  <:menu to={~p"/"} active={@active_tab == :home}>Home</:menu>
+  <:user_profile>
+    <.dm_theme_switcher id="theme-toggle" />
+  </:user_profile>
+</.dm_appbar>
+
 <main>
   <.dm_flash_group flash={@flash} />
   {@inner_content}

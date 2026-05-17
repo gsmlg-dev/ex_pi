@@ -13,7 +13,8 @@ defmodule ExPiWeb.Router do
   scope "/", ExPiWeb do
     pipe_through :browser
 
-    get "/", PageController, :home
-    live "/sessions/:id", SessionLive, :show
+    live "/", HomeLive, :index
+    live "/workdir/:workdir", WorkdirLive, :index
+    live "/workdir/:workdir/sessions/:id", SessionLive, :show
   end
 end

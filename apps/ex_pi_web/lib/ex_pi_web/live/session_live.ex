@@ -2,14 +2,15 @@ defmodule ExPiWeb.SessionLive do
   use ExPiWeb, :live_view
 
   @impl true
-  def mount(%{"id" => session_id}, _session, socket) do
+  def mount(%{"id" => session_id, "workdir" => encoded_workdir}, _session, socket) do
+    workdir = Base.url_decode64!(encoded_workdir)
+    sessions_dir = get_sessions_dir(workdir)
+    File.mkdir_p!(sessions_dir)
+    storage_path = Path.join(sessions_dir, "#{session_id}.jsonl")
+
     if connected?(socket) do
       Phoenix.PubSub.subscribe(ExPiWeb.PubSub, "session:#{session_id}")
     end
-
-    sessions_dir = Path.expand("../../priv/sessions", __DIR__)
-    File.mkdir_p!(sessions_dir)
-    storage_path = Path.join(sessions_dir, "#{session_id}.jsonl")
 
     # Replay messages if they exist
     {:ok, initial_messages} = ExPiSession.Log.replay(storage_path)
@@ -34,6 +35,7 @@ defmodule ExPiWeb.SessionLive do
     # Get or start agent for this session
     _topic = "session:#{session_id}"
 
+
     {:ok, agent} =
       ExPiWeb.SessionManager.get_agent(session_id,
         model: %{id: "mock-model", api: "mock", provider: "mock"},
@@ -43,14 +45,17 @@ defmodule ExPiWeb.SessionLive do
         tools: [ExPiCoding.Tools.Read, ExPiCoding.Tools.Bash, ExPiCoding.Tools.Edit],
         dispatcher_opts: [permission_policy: policy, permission_request_fn: request_fn],
         messages: initial_messages,
-        cwd: File.cwd!()
+        cwd: workdir
       )
 
     {:ok, sessions} = ExPiSession.Log.list_sessions(sessions_dir)
 
     socket =
       socket
+      |> assign(:active_tab, :workdir)
       |> assign(:session_id, session_id)
+      |> assign(:workdir, workdir)
+      |> assign(:encoded_workdir, encoded_workdir)
       |> assign(:sessions_dir, sessions_dir)
       |> assign(:agent, agent)
       |> assign(:input, "")
@@ -64,56 +69,110 @@ defmodule ExPiWeb.SessionLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <div class="flex h-screen relative bg-surface-base text-surface-content">
+    <div class="flex h-[calc(100vh-64px)] relative bg-surface text-on-surface">
       <!-- Sidebar -->
-      <.dm_left_menu id="sidebar" class="w-64 border-r border-base-content/10">
-        <:title>Sessions</:title>
-        <.dm_left_menu_group id="sessions-group">
-          <:title>Active Sessions</:title>
-          <:menu :for={s <- @sessions} to={~p"/sessions/#{s}"} active={s == @session_id}>
-            {s}
-          </:menu>
-        </.dm_left_menu_group>
-        <div class="p-4 border-t border-base-content/10">
-          <.dm_btn phx-click="fork_session" variant="primary" class="w-full">Fork Session</.dm_btn>
+      <aside class="w-72 bg-secondary text-secondary-content border-r border-outline-variant shrink-0 flex flex-col">
+        <div class="p-6 border-b border-secondary-content/10">
+          <div class="flex items-center gap-2 mb-1">
+            <.dm_mdi name="folder-outline" class="w-4 h-4 opacity-70" />
+            <span class="text-xs uppercase tracking-widest font-bold opacity-70">Workspace</span>
+          </div>
+          <h2 class="font-semibold truncate" title={@workdir}>{Path.basename(@workdir)}</h2>
+          <.dm_link navigate={~p"/workdir/#{@encoded_workdir}"} class="text-[10px] text-primary-container hover:underline mt-2 inline-block font-bold">
+            Change Directory
+          </.dm_link>
         </div>
-      </.dm_left_menu>
+
+        <.dm_left_menu id="sidebar-sessions" class="flex-1 overflow-y-auto px-2 pt-4">
+          <:title>Sessions</:title>
+          <.dm_left_menu_group id="sessions-list">
+            <:title>History</:title>
+            <:menu :for={s <- @sessions} to={~p"/workdir/#{@encoded_workdir}/sessions/#{s}"}>
+              <div class="flex items-center gap-2 truncate">
+                <.dm_mdi name="chat-outline" class="w-4 h-4" />
+                <span class="truncate">{s}</span>
+              </div>
+            </:menu>
+          </.dm_left_menu_group>
+        </.dm_left_menu>
+
+        <div class="p-4 border-t border-secondary-content/10">
+          <.dm_btn phx-click="fork_session" variant="primary" class="w-full">
+            <:prefix><.dm_mdi name="source-branch" /></:prefix>
+            Fork Branch
+          </.dm_btn>
+        </div>
+      </aside>
 
       <!-- Main Chat -->
-      <div class="flex-1 flex flex-col min-w-0">
-        <div id="messages" phx-update="stream" class="flex-1 overflow-y-auto p-4 space-y-4">
-          <div :for={{id, message} <- @streams.messages} id={id} class="w-full">
-            <.dm_card variant="bordered" class="w-full">
-              <:title>
-                <span class="text-sm font-mono opacity-60 uppercase">{message.role}</span>
-              </:title>
-              <div class="mt-2 whitespace-pre-wrap font-sans">
-                {render_content(message.content)}
+      <div class="flex-1 flex flex-col min-w-0 bg-surface-container-lowest">
+        <div id="messages" phx-update="stream" class="flex-1 overflow-y-auto p-6 space-y-6">
+          <div :for={{id, message} <- @streams.messages} id={id} class="max-w-4xl mx-auto w-full">
+            <.dm_card variant={if message.role == :user, do: "bordered", else: "glass"} shadow="sm" class="overflow-hidden">
+              <div class="flex items-start gap-4 p-4 text-on-surface">
+                <div class={"mt-1 p-2 rounded-xl #{if message.role == :user, do: "bg-primary text-primary-content", else: "bg-secondary text-secondary-content"}"}>
+                  <.dm_mdi name={if message.role == :user, do: "account", else: "robot"} class="w-5 h-5" />
+                </div>
+                <div class="flex-1 min-w-0">
+                  <div class="flex justify-between items-center mb-1">
+                    <span class="text-xs font-bold uppercase tracking-wider opacity-60 font-mono">{message.role}</span>
+                    <span class="text-[10px] opacity-40 font-mono">{format_timestamp(message.timestamp)}</span>
+                  </div>
+                  <div class="content whitespace-pre-wrap font-sans text-base leading-relaxed">
+                    {render_content(message.content)}
+                  </div>
+                </div>
               </div>
             </.dm_card>
           </div>
         </div>
 
-        <div class="p-4 border-t border-base-content/10 bg-surface-base">
-          <form phx-submit="send_prompt">
-            <.dm_input type="text" name="prompt" value={@input} placeholder="Type a message..." class="w-full" autocomplete="off" />
-          </form>
+        <div class="p-6 border-t border-outline-variant bg-surface">
+          <div class="max-w-4xl mx-auto">
+            <form phx-submit="send_prompt">
+              <div class="relative">
+                <.dm_input
+                  type="text"
+                  name="prompt"
+                  value={@input}
+                  placeholder="Ask π anything..."
+                  class="w-full pr-12"
+                  autocomplete="off"
+                />
+                <div class="absolute right-2 top-1/2 -translate-y-1/2">
+                  <.dm_btn type="submit" variant="ghost" shape="circle" size="sm">
+                    <.dm_mdi name="send" class="text-primary w-5 h-5" />
+                  </.dm_btn>
+                </div>
+              </div>
+            </form>
+            <p class="mt-3 text-[10px] text-center text-on-surface-variant opacity-60">
+              π is an AI agent. Review its work carefully. Press Enter to send.
+            </p>
+          </div>
         </div>
       </div>
 
       <!-- Modal -->
       <.dm_modal :if={@permission_request} id="permission-modal">
-        <:title>Permission Required</:title>
+        <:title>
+          <div class="flex items-center gap-2 text-warning">
+            <.dm_mdi name="shield-alert" class="w-6 h-6" />
+            <span>Security Interceptor</span>
+          </div>
+        </:title>
         <:body>
-          <p class="mb-4">
-            The agent wants to call tool <code class="bg-surface-base px-1 rounded">{@permission_request.tool_call.name}</code>
-            with arguments:
+          <p class="mb-4 text-on-surface">
+            The agent is requesting permission to execute a <span class="font-bold">{@permission_request.tool_call.name}</span> command.
           </p>
-          <pre class="bg-surface-base p-2 rounded mb-4 overflow-x-auto text-sm">{Jason.encode!(@permission_request.tool_call.arguments, pretty: true)}</pre>
+          <div class="bg-surface-container-high p-4 rounded-xl border border-outline-variant text-on-surface">
+             <p class="text-xs uppercase tracking-widest font-bold opacity-50 mb-2">Arguments</p>
+             <pre class="overflow-x-auto text-sm font-mono leading-relaxed">{Jason.encode!(@permission_request.tool_call.arguments, pretty: true)}</pre>
+          </div>
         </:body>
         <:footer>
           <.dm_btn phx-click="permission_deny" variant="ghost">Deny</.dm_btn>
-          <.dm_btn phx-click="permission_allow" variant="primary">Allow</.dm_btn>
+          <.dm_btn phx-click="permission_allow" variant="primary">Authorize Execution</.dm_btn>
         </:footer>
       </.dm_modal>
     </div>
@@ -131,6 +190,11 @@ defmodule ExPiWeb.SessionLive do
     |> Enum.join("\n")
   end
 
+  defp format_timestamp(ts) when is_integer(ts) do
+    ts |> DateTime.from_unix!(:millisecond) |> Calendar.strftime("%H:%M:%S")
+  end
+  defp format_timestamp(_), do: ""
+
   @impl true
   def handle_event("fork_session", _, socket) do
     new_id = "fork_#{System.unique_integer([:positive])}"
@@ -141,7 +205,7 @@ defmodule ExPiWeb.SessionLive do
     {:ok, messages} = ExPiSession.Log.replay(source_path)
     ExPiSession.Log.fork(source_path, target_path, length(messages))
 
-    {:noreply, push_navigate(socket, to: ~p"/sessions/#{new_id}")}
+    {:noreply, push_navigate(socket, to: ~p"/workdir/#{socket.assigns.encoded_workdir}/sessions/#{new_id}")}
   end
 
   @impl true
@@ -185,6 +249,12 @@ defmodule ExPiWeb.SessionLive do
   @impl true
   def handle_info(_event, socket) do
     {:noreply, socket}
+  end
+
+  defp get_sessions_dir(workdir) do
+    # Map workdir to a safe folder name
+    encoded_cwd = Base.url_encode64(workdir)
+    Path.expand("../../priv/sessions/#{encoded_cwd}", __DIR__)
   end
 end
 
