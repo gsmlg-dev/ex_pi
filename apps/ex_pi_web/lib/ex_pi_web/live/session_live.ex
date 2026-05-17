@@ -110,7 +110,7 @@ defmodule ExPiWeb.SessionLive do
             variant="primary"
             class="w-full"
           >
-            <:prefix><.dm_mdi name="source-branch" /></:prefix>
+            <:prefix><.dm_mdi name="source-branch" class="w-4 h-4" /></:prefix>
             Fork Branch
           </.dm_btn>
         </div>

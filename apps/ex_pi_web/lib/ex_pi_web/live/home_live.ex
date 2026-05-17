@@ -116,7 +116,7 @@ defmodule ExPiWeb.HomeLive do
                    phx-value-name={entry.name}
                    class="flex items-center gap-3 p-3 hover:bg-primary/5 cursor-pointer group transition-colors text-on-surface">
                 <.dm_mdi name={if entry.is_dir, do: "folder", else: "file-outline"} 
-                         class={if entry.is_dir, do: "text-secondary", else: "text-on-surface-variant opacity-40"} />
+                         class={["w-5 h-5 shrink-0", if(entry.is_dir, do: "text-secondary", else: "text-on-surface-variant opacity-40")]} />
                 <span class={"text-sm truncate flex-1 #{if !entry.is_dir, do: "opacity-60"}"}>{entry.name}</span>
                 <.dm_mdi :if={entry.is_dir} name="chevron-right" class="w-4 h-4 opacity-0 group-hover:opacity-40 transition-opacity" />
               </div>

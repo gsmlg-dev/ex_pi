@@ -13,26 +13,25 @@ defmodule ExPiWeb.HomeLiveIntegrationTest do
   test "navigates to add repository page", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/")
     
-    view 
-    |> element("#add-repo-btn") 
-    |> render_click()
+    {:ok, _view, html} = 
+      view 
+      |> element("#add-repo-btn") 
+      |> render_click()
+      |> follow_redirect(conn, "/workdir/new/project")
 
-    assert_patch(view, "/workdir/new/project")
-    assert render(view) =~ "Add Project Repository"
-    assert render(view) =~ "Selected Path"
+    assert html =~ "Add Project Repository"
+    assert html =~ "Selected Path"
   end
 
   test "adds valid repo and returns to index", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/workdir/new/project")
     
     # By default browser shows user home
-    render_click(view, "browser_confirm")
+    {:ok, _view, html} = 
+      view 
+      |> render_click("browser_confirm") 
+      |> follow_redirect(conn, "/")
     
-    # Should redirect to index
-    assert_redirected(view, "/")
-    
-    # Check index content
-    {:ok, view, html} = live(conn, "/")
     assert html =~ "Repository added successfully."
     home = System.user_home!()
     assert html =~ Path.basename(home)

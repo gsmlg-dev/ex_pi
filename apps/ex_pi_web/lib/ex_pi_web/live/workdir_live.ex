@@ -43,7 +43,7 @@ defmodule ExPiWeb.WorkdirLive do
                 variant="primary"
                 class="w-full mb-4"
               >
-                <:prefix><.dm_mdi name="plus" /></:prefix>
+                <:prefix><.dm_mdi name="plus" class="w-4 h-4" /></:prefix>
                 New Session
               </.dm_btn>
             </div>
@@ -95,7 +95,7 @@ defmodule ExPiWeb.WorkdirLive do
             >
               <:title>
                 <div class="flex items-center gap-3 overflow-hidden text-on-surface">
-                  <.dm_mdi name="chat-processing-outline" class="text-primary" />
+                  <.dm_mdi name="chat-processing-outline" class="w-5 h-5 text-primary" />
                   <span class="truncate">{s}</span>
                 </div>
               </:title>
