@@ -75,14 +75,9 @@ defmodule ExPiWeb.HomeLive do
           </div>
 
           <:action>
-            <div class="flex gap-2 w-full">
-              <.dm_link navigate={~p"/workdir/#{Base.url_encode64(repo["path"], padding: false)}"} class="dm-btn dm-btn--outline flex-1 text-center">
-                Open
-              </.dm_link>
-              <.dm_btn id={"remove-repo-#{Base.encode16(:crypto.hash(:md5, repo["path"]), case: :lower)}"} phx-click="remove_repo" phx-value-path={repo["path"]} phx-hook="WebComponentHook" variant="error" shape="circle" size="sm">
-                <.dm_mdi name="delete-outline" class="w-4 h-4" />
-              </.dm_btn>
-            </div>
+            <.dm_link navigate={~p"/workdir/#{Base.url_encode64(repo["path"], padding: false)}"} class="dm-btn dm-btn--primary w-full text-center">
+              Open Project
+            </.dm_link>
           </:action>
         </.dm_card>
       </div>
@@ -208,12 +203,6 @@ defmodule ExPiWeb.HomeLive do
       _error ->
         {:noreply, assign(socket, error: "Could not add repository.")}
     end
-  end
-
-  @impl true
-  def handle_event("remove_repo", %{"path" => path}, socket) do
-    RepoManager.remove_repo(path)
-    {:noreply, assign(socket, repos: RepoManager.list_repos())}
   end
 
   defp update_browser(socket) do
