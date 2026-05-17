@@ -129,6 +129,7 @@ defmodule ExPiWeb.SettingsLive do
               <select name="api_type" class="w-full bg-surface-container rounded-lg border border-outline-variant p-2 text-sm text-on-surface">
                 <option value="anthropic" selected={p["api_type"] == "anthropic"}>Anthropic</option>
                 <option value="openai" selected={p["api_type"] == "openai"}>OpenAI</option>
+                <option value="req_llm" selected={p["api_type"] == "req_llm"}>ReqLLM (Unified)</option>
               </select>
             </div>
             <div class="space-y-1">

@@ -45,6 +45,7 @@ defmodule ExPiWeb.SessionLive do
           case config["api_type"] do
             "anthropic" -> ExPiAi.Providers.Anthropic
             "openai" -> ExPiAi.Providers.OpenAI
+            "req_llm" -> ExPiAi.Providers.ReqLLM
             _ -> MockProvider
           end
 

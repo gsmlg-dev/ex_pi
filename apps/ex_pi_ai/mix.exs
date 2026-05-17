@@ -24,6 +24,7 @@ defmodule ExPiAi.MixProject do
   defp deps do
     [
       {:req, "~> 0.5.0"},
+      {:req_llm, "~> 1.0"},
       {:jason, "~> 1.4"}
     ]
   end
