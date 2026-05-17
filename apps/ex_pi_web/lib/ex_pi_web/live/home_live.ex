@@ -7,17 +7,22 @@ defmodule ExPiWeb.HomeLive do
     File.mkdir_p!(sessions_root)
 
     recent_workdirs =
-      sessions_root
-      |> File.ls!()
-      |> Enum.filter(&File.dir?(Path.join(sessions_root, &1)))
-      |> Enum.map(fn encoded ->
-        case Base.url_decode64(encoded, padding: false) do
-          {:ok, path} -> {encoded, path}
-          _ -> nil
-        end
-      end)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.sort_by(fn {_, path} -> path end)
+      case File.ls(sessions_root) do
+        {:ok, files} ->
+          files
+          |> Enum.filter(&File.dir?(Path.join(sessions_root, &1)))
+          |> Enum.map(fn encoded ->
+            case Base.url_decode64(encoded, padding: false) do
+              {:ok, path} -> {encoded, path}
+              _ -> nil
+            end
+          end)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.sort_by(fn {_, path} -> path end)
+
+        _ ->
+          []
+      end
 
     {:ok, assign(socket, active_tab: :home, workdir: "", error: nil, recent_workdirs: recent_workdirs)}
   end
@@ -112,17 +117,27 @@ defmodule ExPiWeb.HomeLive do
 
   @impl true
   def handle_event("open_workdir", %{"workdir" => path}, socket) do
-    path = String.trim(path)
+    path = path |> String.trim() |> Path.expand()
+    is_dir = File.dir?(path)
 
-    if File.dir?(path) do
+    if is_dir do
       encoded_path = Base.url_encode64(path, padding: false)
       {:noreply, push_navigate(socket, to: ~p"/workdir/#{encoded_path}")}
     else
-      {:noreply, assign(socket, workdir: path, error: "Directory does not exist or is not accessible.")}
+      IO.inspect(path, label: "HomeLive.open_workdir: Path is not a directory")
+      error = "Path '#{path}' does not exist or is not a directory accessible to the server."
+      {:noreply, assign(socket, workdir: path, error: error)}
     end
   end
 
   defp get_sessions_root do
-    Path.join(:code.priv_dir(:ex_pi_web), "sessions")
+    case :code.priv_dir(:ex_pi_web) do
+      {:error, :bad_name} ->
+        # Fallback for dev if app not found
+        Path.expand("priv/sessions", File.cwd!())
+
+      path ->
+        Path.join(List.to_string(path), "sessions")
+    end
   end
 end

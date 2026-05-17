@@ -252,9 +252,15 @@ defmodule ExPiWeb.SessionLive do
   end
 
   defp get_sessions_dir(workdir) do
-    # Map workdir to a safe folder name
     encoded_cwd = Base.url_encode64(workdir, padding: false)
-    Path.join([:code.priv_dir(:ex_pi_web), "sessions", encoded_cwd])
+
+    root =
+      case :code.priv_dir(:ex_pi_web) do
+        {:error, :bad_name} -> Path.expand("priv/sessions", File.cwd!())
+        path -> Path.join(List.to_string(path), "sessions")
+      end
+
+    Path.join(root, encoded_cwd)
   end
 end
 

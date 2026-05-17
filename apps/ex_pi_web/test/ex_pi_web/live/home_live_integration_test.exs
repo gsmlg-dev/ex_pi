@@ -22,6 +22,6 @@ defmodule ExPiWeb.HomeLiveIntegrationTest do
     
     render_submit(view, "open_workdir", %{"workdir" => path})
     
-    assert render(view) =~ "Directory does not exist or is not accessible."
+    assert render(view) =~ "does not exist or is not a directory accessible to the server."
   end
 end
