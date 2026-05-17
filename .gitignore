@@ -22,3 +22,26 @@ erl_crash.dump
 # Also ignore archive artifacts (built via "mix archive.build").
 *.ez
 
+# Compiled artifacts
+*.beam
+
+# Local session data and temporary files
+/apps/*/tmp/
+/apps/*/priv/sessions/
+/apps/*/lib/priv/sessions/
+
+# Language Server
+/.elixir_ls/
+/.lexical/
+
+# Editor files
+*.swp
+*~
+.DS_Store
+
+# Javascript
+/apps/ex_pi_web/assets/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
