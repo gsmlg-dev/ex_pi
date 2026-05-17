@@ -84,10 +84,29 @@ defmodule ExPiAi.Providers.ReqLLM do
 
   defp transform_messages(messages) do
     Enum.map(messages, fn
-      %{role: :user, content: content} -> %{role: "user", content: content}
-      %{role: :assistant, content: content} -> %{role: "assistant", content: transform_content(content)}
+      %{role: :user, content: content} ->
+        %{role: "user", content: content}
+
+      %{role: :assistant, content: content} ->
+        %{role: "assistant", content: transform_content(content)}
+
+      %{role: :tool_result, tool_call_id: id, content: content} ->
+        %{
+          role: "tool",
+          tool_call_id: id,
+          content: transform_tool_result_content(content)
+        }
     end)
   end
+
+  defp transform_tool_result_content(content) when is_list(content) do
+    Enum.map_join(content, "\n", fn
+      %{type: :text, text: text} -> text
+      _ -> ""
+    end)
+  end
+
+  defp transform_tool_result_content(content), do: content
 
   defp transform_content(content) when is_list(content) do
     Enum.map(content, fn

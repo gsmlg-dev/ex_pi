@@ -17,7 +17,7 @@ defmodule ExPiWeb.SessionLive do
     # Replay messages if they exist
     {:ok, initial_messages} = ExPiSession.Log.replay(storage_path)
 
-    {:ok, policy} = ExPiCoding.PermissionPolicy.start_link(default: :ask)
+    {:ok, policy} = ExPiCoding.PermissionPolicy.start_link(default: :allow)
 
     request_fn = fn tool_call ->
       Phoenix.PubSub.broadcast(ExPiWeb.PubSub, "session:#{session_id}", {:permission_request, self(), tool_call})
