@@ -110,19 +110,21 @@ defmodule ExPiAi.Providers.Anthropic do
           {{:start, new_acc}, new_acc}
 
         %{"type" => "content_block_start", "index" => idx, "content_block" => block} ->
-          {type, initial_block} = case block["type"] do
-            "text" -> {:text, %{type: :text, text: ""}}
-            "thinking" -> {:thinking, %{type: :thinking, thinking: ""}}
-            "tool_use" -> {:tool_call, %{type: :tool_call, id: block["id"], name: block["name"], partial_json: ""}}
+          result = case block["type"] do
+            "text" -> {:text, %{type: :text, text: ""}, :text_start}
+            "thinking" -> {:thinking, %{type: :thinking, thinking: ""}, :thinking_start}
+            "tool_use" -> {:tool_call, %{type: :tool_call, id: block["id"], name: block["name"], partial_json: ""}, :toolcall_start}
+            _ -> nil
           end
-          new_content = List.insert_at(acc.content, idx, initial_block)
-          new_acc = %{acc | content: new_content}
-          event_type = case type do
-            :text -> :text_start
-            :thinking -> :thinking_start
-            :tool_call -> :toolcall_start
+
+          if result do
+            {_type, initial_block, event_type} = result
+            new_content = List.insert_at(acc.content, idx, initial_block)
+            new_acc = %{acc | content: new_content}
+            {{event_type, idx, new_acc}, new_acc}
+          else
+            {nil, acc}
           end
-          {{event_type, idx, new_acc}, new_acc}
 
         %{"type" => "content_block_delta", "index" => idx, "delta" => delta} ->
           case delta["type"] do
@@ -151,24 +153,31 @@ defmodule ExPiAi.Providers.Anthropic do
               end)
               new_acc = %{acc | content: new_content}
               {{:toolcall_delta, idx, partial_json, new_acc}, new_acc}
+            
+            _ -> {nil, acc}
           end
 
         %{"type" => "content_block_stop", "index" => idx} ->
           # Finalize block
           block = Enum.at(acc.content, idx)
-          case block.type do
-            :text -> {{:text_end, idx, block.text, acc}, acc}
-            :thinking -> {{:thinking_end, idx, block.thinking, acc}, acc}
-            :tool_call ->
-              # Parse JSON
-              args = case Jason.decode(block.partial_json) do
-                {:ok, decoded} -> decoded
-                _ -> %{}
-              end
-              tool_call = %{type: :tool_call, id: block.id, name: block.name, arguments: args}
-              new_content = List.replace_at(acc.content, idx, tool_call)
-              new_acc = %{acc | content: new_content}
-              {{:toolcall_end, idx, tool_call, new_acc}, new_acc}
+          if block do
+            case block.type do
+              :text -> {{:text_end, idx, block.text, acc}, acc}
+              :thinking -> {{:thinking_end, idx, block.thinking, acc}, acc}
+              :tool_call ->
+                # Parse JSON
+                args = case Jason.decode(block.partial_json) do
+                  {:ok, decoded} -> decoded
+                  _ -> %{}
+                end
+                tool_call = %{type: :tool_call, id: block.id, name: block.name, arguments: args}
+                new_content = List.replace_at(acc.content, idx, tool_call)
+                new_acc = %{acc | content: new_content}
+                {{:toolcall_end, idx, tool_call, new_acc}, new_acc}
+              _ -> {nil, acc}
+            end
+          else
+            {nil, acc}
           end
 
         %{"type" => "message_delta", "delta" => delta, "usage" => usage} ->
