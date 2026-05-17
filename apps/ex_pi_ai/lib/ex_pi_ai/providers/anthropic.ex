@@ -72,6 +72,7 @@ defmodule ExPiAi.Providers.Anthropic do
         cost: %{input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0, total: 0.0}
       },
       stop_reason: nil,
+      response_id: nil,
       timestamp: System.system_time(:millisecond)
     }
   end
