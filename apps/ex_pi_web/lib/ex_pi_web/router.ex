@@ -16,6 +16,7 @@ defmodule ExPiWeb.Router do
     live "/", HomeLive, :index
     live "/settings/credentials", SettingsLive, :credentials
     live "/settings/providers", SettingsLive, :providers
+    live "/settings/system_prompt", SettingsLive, :system_prompt
     live "/settings", SettingsLive, :index
     live "/workdir/:workdir", WorkdirLive, :index
     live "/workdir/new/project", HomeLive, :add

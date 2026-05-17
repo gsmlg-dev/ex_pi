@@ -61,21 +61,38 @@ defmodule ExPiWeb.SettingsLive do
               <.dm_mdi name="key-outline" class="w-5 h-5" />
               <span>Credentials</span>
             </.dm_link>
+
+            <.dm_link
+              patch={~p"/settings/system_prompt"}
+              class={["p-4 rounded-2xl border transition-all flex items-center gap-3 font-bold", 
+                if(@live_action == :system_prompt, 
+                   do: "bg-primary text-primary-content border-primary shadow-lg", 
+                   else: "bg-surface-container border-outline-variant hover:bg-surface-container-high"
+                )]}
+            >
+              <.dm_mdi name="text-box-outline" class="w-5 h-5" />
+              <span>System Prompt</span>
+            </.dm_link>
           </nav>
         </aside>
 
         <!-- Main Content -->
         <main class="md:col-span-3">
-          <%= if @live_action == :providers do %>
-            <.render_providers 
-              providers={@config["providers"]} 
-              credentials={@config["credentials"]}
-              active_id={@config["active_provider_id"]}
-            />
-          <% else %>
-            <.render_credentials 
-              credentials={@config["credentials"]}
-            />
+          <%= case @live_action do %>
+            <% :providers -> %>
+              <.render_providers 
+                providers={@config["providers"]} 
+                credentials={@config["credentials"]}
+                active_id={@config["active_provider_id"]}
+              />
+            <% :credentials -> %>
+              <.render_credentials 
+                credentials={@config["credentials"]}
+              />
+            <% :system_prompt -> %>
+              <.render_system_prompt 
+                system_prompt={@config["system_prompt"]}
+              />
           <% end %>
         </main>
       </div>
@@ -201,6 +218,46 @@ defmodule ExPiWeb.SettingsLive do
     """
   end
 
+  defp render_system_prompt(assigns) do
+    ~H"""
+    <div class="space-y-6">
+      <div class="flex justify-between items-center text-on-surface">
+        <h2 class="text-2xl font-bold font-display">System Prompt</h2>
+      </div>
+
+      <.dm_card variant="bordered" class="bg-surface-container-low">
+        <form phx-submit="save_system_prompt" class="space-y-4">
+          <div class="space-y-2">
+            <label class="text-[10px] font-bold opacity-40 uppercase tracking-wider text-on-surface">Base Instructions</label>
+            <textarea
+              name="system_prompt"
+              rows="15"
+              class="w-full bg-surface-container rounded-xl border border-outline-variant p-4 text-sm text-on-surface font-mono leading-relaxed focus:outline-none focus:ring-2 focus:ring-primary/20"
+            >{@system_prompt}</textarea>
+          </div>
+          
+          <div class="flex justify-end pt-4 border-t border-outline-variant">
+             <.dm_btn type="submit" phx-hook="WebComponentHook" variant="primary" size="md">
+               Save System Prompt
+             </.dm_btn>
+          </div>
+        </form>
+      </.dm_card>
+
+      <div class="bg-primary/5 rounded-2xl p-6 border border-primary/10">
+        <div class="flex items-center gap-2 text-primary mb-2">
+          <.dm_mdi name="information-outline" class="w-5 h-5" />
+          <span class="font-bold">About the System Prompt</span>
+        </div>
+        <p class="text-sm text-on-surface-variant leading-relaxed">
+          The system prompt defines the core identity and rules for the agent. 
+          It is sent at the beginning of every session to ensure the AI follows specific formatting and safety guidelines.
+        </p>
+      </div>
+    </div>
+    """
+  end
+
   # Handlers
 
   @impl true
@@ -261,6 +318,12 @@ defmodule ExPiWeb.SettingsLive do
   def handle_event("delete_credential", %{"id" => id}, socket) do
     ConfigManager.delete_credential(id)
     {:noreply, load_config(socket)}
+  end
+
+  @impl true
+  def handle_event("save_system_prompt", %{"system_prompt" => prompt}, socket) do
+    ConfigManager.update_system_prompt(prompt)
+    {:noreply, socket |> load_config() |> put_flash(:info, "System prompt updated")}
   end
 
   defp load_config(socket) do

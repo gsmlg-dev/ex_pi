@@ -35,7 +35,9 @@ defmodule ExPiWeb.SessionLive do
     end
 
     # Get active config
+    system_config = ConfigManager.get_config()
     config = ConfigManager.get_active_provider_config()
+    system_prompt = Map.get(system_config, "system_prompt")
 
     {provider_mod, model_id, provider_id, api_key, base_url} =
       if Mix.env() == :test do
@@ -63,7 +65,7 @@ defmodule ExPiWeb.SessionLive do
           api_key: api_key,
           base_url: base_url
         ],
-        system_prompt: "You are a helpful assistant.",
+        system_prompt: system_prompt,
         on_event: on_event,
         tools: [ExPiCoding.Tools.Read, ExPiCoding.Tools.Bash, ExPiCoding.Tools.Edit],
         dispatcher_opts: [permission_policy: policy, permission_request_fn: request_fn],

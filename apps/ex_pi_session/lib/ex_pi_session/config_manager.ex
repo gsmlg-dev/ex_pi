@@ -7,6 +7,7 @@ defmodule ExPiSession.ConfigManager do
 
   @default_config %{
     "active_provider_id" => "anthropic-default",
+    "system_prompt" => "You are an expert coding assistant operating inside π (ExPi), an Elixir-based coding agent.\nYou help users by reading files, executing commands, editing code, and writing new files.\n\nGuidelines:\n- Be concise in your responses.\n- Show file paths clearly when working with files.\n- Use bash for file operations like ls, rg, find.\n- When editing files, ensure the code remains correct and idiomatic.\n- You have access to tools for reading files, executing bash commands, and editing/writing files.",
     "credentials" => %{
       "sample-credential" => %{
         "id" => "sample-credential",
@@ -142,6 +143,12 @@ defmodule ExPiSession.ConfigManager do
   def set_active_provider(id) do
     get_config()
     |> Map.put("active_provider_id", id)
+    |> save_config()
+  end
+
+  def update_system_prompt(prompt) do
+    get_config()
+    |> Map.put("system_prompt", prompt)
     |> save_config()
   end
 
