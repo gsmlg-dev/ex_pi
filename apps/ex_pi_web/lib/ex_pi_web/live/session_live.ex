@@ -35,20 +35,20 @@ defmodule ExPiWeb.SessionLive do
     end
 
     # Get active config
-    config = ConfigManager.get_active_provider()
+    config = ConfigManager.get_active_provider_config()
 
-    {provider_mod, model_id, provider_id} =
+    {provider_mod, model_id, provider_id, api_key, base_url} =
       if Mix.env() == :test do
-        {MockProvider, "mock-model", "mock"}
+        {MockProvider, "mock-model", "mock", "mock-key", "https://api.mock.com"}
       else
         mod =
-          case config["id"] do
+          case config["api_type"] do
             "anthropic" -> ExPiAi.Providers.Anthropic
             "openai" -> ExPiAi.Providers.OpenAI
             _ -> MockProvider
           end
 
-        {mod, config["default_model"], config["id"]}
+        {mod, config["model"], config["api_type"], config["resolved_key"], config["base_url"]}
       end
 
     # Get or start agent for this session
@@ -59,8 +59,8 @@ defmodule ExPiWeb.SessionLive do
         model: %{id: model_id, api: provider_id, provider: provider_id},
         provider: provider_mod,
         options: [
-          api_key: config["api_key"],
-          base_url: config["base_url"]
+          api_key: api_key,
+          base_url: base_url
         ],
         system_prompt: "You are a helpful assistant.",
         on_event: on_event,
@@ -245,8 +245,8 @@ defmodule ExPiWeb.SessionLive do
   defp render_content(content) when is_list(content) do
     Enum.map(content, fn
       %{type: :text, text: text} -> text
-      %{type: :thinking, thinking: thinking} -> "[Thinking: \#{thinking}]"
-      %{type: :tool_call, name: name} -> "[Calling tool: \#{name}]"
+      %{type: :thinking, thinking: _thinking} -> "[Thinking...]"
+      %{type: :tool_call, name: _name} -> "[Calling tool...]"
       _ -> ""
     end)
     |> Enum.join("\n")
@@ -260,9 +260,9 @@ defmodule ExPiWeb.SessionLive do
 
   @impl true
   def handle_event("fork_session", _, socket) do
-    new_id = "fork_\#{System.unique_integer([:positive])}"
-    source_path = Path.join(socket.assigns.sessions_dir, "\#{socket.assigns.session_id}.jsonl")
-    target_path = Path.join(socket.assigns.sessions_dir, "\#{new_id}.jsonl")
+    new_id = "fork_#{System.unique_integer([:positive])}"
+    source_path = Path.join(socket.assigns.sessions_dir, "#{socket.assigns.session_id}.jsonl")
+    target_path = Path.join(socket.assigns.sessions_dir, "#{new_id}.jsonl")
 
     # Fork the log (take all current messages)
     {:ok, messages} = ExPiSession.Log.replay(source_path)

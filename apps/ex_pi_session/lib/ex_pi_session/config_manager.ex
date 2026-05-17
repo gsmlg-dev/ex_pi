@@ -6,32 +6,30 @@ defmodule ExPiSession.ConfigManager do
   @config_file "config.json"
 
   @default_config %{
-    "active_provider" => "anthropic",
+    "active_provider_id" => "anthropic-default",
+    "credentials" => %{
+      "sample-credential" => %{
+        "id" => "sample-credential",
+        "name" => "Sample API Key",
+        "key" => ""
+      }
+    },
     "providers" => %{
-      "anthropic" => %{
-        "id" => "anthropic",
-        "name" => "Anthropic",
-        "api_key" => "",
-        "base_url" => "https://api.anthropic.com",
-        "default_model" => "claude-3-5-sonnet-latest",
-        "models" => [
-          "claude-3-5-sonnet-latest",
-          "claude-3-5-haiku-latest",
-          "claude-3-opus-latest"
-        ]
+      "anthropic-default" => %{
+        "id" => "anthropic-default",
+        "name" => "Anthropic Claude",
+        "api_type" => "anthropic",
+        "credential_id" => "",
+        "model" => "claude-3-5-sonnet-latest",
+        "base_url" => "https://api.anthropic.com"
       },
-      "openai" => %{
-        "id" => "openai",
-        "name" => "OpenAI",
-        "api_key" => "",
-        "base_url" => "https://api.openai.com/v1",
-        "default_model" => "gpt-4o",
-        "models" => [
-          "gpt-4o",
-          "gpt-4o-mini",
-          "o1-preview",
-          "o1-mini"
-        ]
+      "openai-default" => %{
+        "id" => "openai-default",
+        "name" => "OpenAI GPT-4o",
+        "api_type" => "openai",
+        "credential_id" => "",
+        "model" => "gpt-4o",
+        "base_url" => "https://api.openai.com/v1"
       }
     }
   }
@@ -43,7 +41,7 @@ defmodule ExPiSession.ConfigManager do
       case File.read(path) do
         {:ok, content} ->
           user_config = Jason.decode!(content)
-          # Merge with defaults to ensure new fields are present
+          # Merge with defaults to ensure basic structure
           deep_merge(@default_config, user_config)
 
         _ ->
@@ -61,28 +59,104 @@ defmodule ExPiSession.ConfigManager do
     {:ok, config}
   end
 
-  def get_active_provider do
+  # Credentials Management
+
+  def add_credential(name, key) do
+    id = "cred_#{System.unique_integer([:positive])}"
     config = get_config()
-    provider_id = config["active_provider"]
-    config["providers"][provider_id]
+    credentials = Map.get(config, "credentials", %{})
+    new_cred = %{"id" => id, "name" => name, "key" => key}
+    
+    config
+    |> Map.put("credentials", Map.put(credentials, id, new_cred))
+    |> save_config()
   end
 
-  def update_provider_config(provider_id, updates) do
+  def update_credential(id, updates) do
     config = get_config()
-    providers = config["providers"]
-    provider = providers[provider_id] || %{}
-    new_provider = Map.merge(provider, updates)
-    new_providers = Map.put(providers, provider_id, new_provider)
+    credentials = config["credentials"]
+    cred = credentials[id] || %{"id" => id}
+    new_cred = Map.merge(cred, updates)
+    
+    config
+    |> Map.put("credentials", Map.put(credentials, id, new_cred))
+    |> save_config()
+  end
+
+  def delete_credential(id) do
+    config = get_config()
+    credentials = Map.delete(config["credentials"], id)
+    
+    # Also clear credential_id from any providers using it
+    providers = Enum.into(config["providers"], %{}, fn {pid, p} ->
+      if p["credential_id"] == id do
+        {pid, Map.put(p, "credential_id", "")}
+      else
+        {pid, p}
+      end
+    end)
 
     config
-    |> Map.put("providers", new_providers)
+    |> Map.put("credentials", credentials)
+    |> Map.put("providers", providers)
     |> save_config()
   end
 
-  def set_active_provider(provider_id) do
-    get_config()
-    |> Map.put("active_provider", provider_id)
+  # Providers Management
+
+  def add_provider(params) do
+    id = "prov_#{System.unique_integer([:positive])}"
+    config = get_config()
+    providers = Map.get(config, "providers", %{})
+    new_provider = Map.put(params, "id", id)
+
+    config
+    |> Map.put("providers", Map.put(providers, id, new_provider))
     |> save_config()
+  end
+
+  def update_provider(id, updates) do
+    config = get_config()
+    providers = config["providers"]
+    provider = providers[id] || %{"id" => id}
+    new_provider = Map.merge(provider, updates)
+
+    config
+    |> Map.put("providers", Map.put(providers, id, new_provider))
+    |> save_config()
+  end
+
+  def delete_provider(id) do
+    config = get_config()
+    providers = Map.delete(config["providers"], id)
+    
+    # Reset active provider if deleted
+    active_id = if config["active_provider_id"] == id, do: "", else: config["active_provider_id"]
+
+    config
+    |> Map.put("providers", providers)
+    |> Map.put("active_provider_id", active_id)
+    |> save_config()
+  end
+
+  def set_active_provider(id) do
+    get_config()
+    |> Map.put("active_provider_id", id)
+    |> save_config()
+  end
+
+  def get_active_provider_config do
+    config = get_config()
+    provider_id = config["active_provider_id"]
+    provider = config["providers"][provider_id]
+    
+    if provider do
+      # Resolve credential
+      credential = config["credentials"][provider["credential_id"]]
+      Map.put(provider, "resolved_key", (credential && credential["key"]) || "")
+    else
+      nil
+    end
   end
 
   defp config_path do
@@ -92,7 +166,6 @@ defmodule ExPiSession.ConfigManager do
 
   defp get_priv_root do
     if Mix.env() == :dev do
-      # Find umbrella root by looking for mix.exs
       cwd = File.cwd!()
       root = if File.exists?(Path.join(cwd, "apps")), do: cwd, else: Path.expand("../..", cwd)
       Path.join(root, "apps/ex_pi_session/priv")
