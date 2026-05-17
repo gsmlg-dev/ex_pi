@@ -10,6 +10,13 @@
     "@duskmoon-dev/css-art": "latest",
     "@duskmoon-dev/elements": "latest",
     "@duskmoon-dev/art-elements": "latest",
-    "topbar": "^0.1.4"
+    "topbar": "^0.1.4",
+    "@duskmoon-dev/el-button": "latest",
+    "@duskmoon-dev/el-card": "latest",
+    "@duskmoon-dev/el-dialog": "latest",
+    "@duskmoon-dev/el-input": "latest",
+    "@duskmoon-dev/el-menu": "latest",
+    "@duskmoon-dev/el-badge": "latest",
+    "@duskmoon-dev/el-chip": "latest"
   }
 }

@@ -35,7 +35,6 @@ defmodule ExPiWeb.SessionLive do
     # Get or start agent for this session
     _topic = "session:#{session_id}"
 
-
     {:ok, agent} =
       ExPiWeb.SessionManager.get_agent(session_id,
         model: %{id: "mock-model", api: "mock", provider: "mock"},
@@ -78,7 +77,10 @@ defmodule ExPiWeb.SessionLive do
             <span class="text-xs uppercase tracking-widest font-bold opacity-70">Workspace</span>
           </div>
           <h2 class="font-semibold truncate" title={@workdir}>{Path.basename(@workdir)}</h2>
-          <.dm_link navigate={~p"/workdir/#{@encoded_workdir}"} class="text-[10px] text-primary-container hover:underline mt-2 inline-block font-bold">
+          <.dm_link
+            navigate={~p"/workdir/#{@encoded_workdir}"}
+            class="text-[10px] text-primary-content hover:underline mt-2 inline-block font-bold"
+          >
             Change Directory
           </.dm_link>
         </div>
@@ -87,7 +89,11 @@ defmodule ExPiWeb.SessionLive do
           <:title>Sessions</:title>
           <.dm_left_menu_group id="sessions-list" active={@session_id}>
             <:title>History</:title>
-            <:menu :for={s <- @sessions} to={~p"/workdir/#{@encoded_workdir}/sessions/#{s}"} id={s}>
+            <:menu
+              :for={s <- @sessions}
+              to={~p"/workdir/#{@encoded_workdir}/sessions/#{s}"}
+              id={"session-link-#{s}"}
+            >
               <div class="flex items-center gap-2 truncate">
                 <.dm_mdi name="chat-outline" class="w-4 h-4" />
                 <span class="truncate">{s}</span>
@@ -97,7 +103,13 @@ defmodule ExPiWeb.SessionLive do
         </.dm_left_menu>
 
         <div class="p-4 border-t border-secondary-content/10 text-center">
-          <.dm_btn phx-click="fork_session" variant="primary" class="w-full">
+          <.dm_btn
+            id="fork-session-btn"
+            phx-click="fork_session"
+            phx-hook="WebComponentHook"
+            variant="primary"
+            class="w-full"
+          >
             <:prefix><.dm_mdi name="source-branch" /></:prefix>
             Fork Branch
           </.dm_btn>
@@ -108,15 +120,25 @@ defmodule ExPiWeb.SessionLive do
       <div class="flex-1 flex flex-col min-w-0 bg-surface-container-lowest">
         <div id="messages" phx-update="stream" class="flex-1 overflow-y-auto p-6 space-y-6">
           <div :for={{id, message} <- @streams.messages} id={id} class="max-w-4xl mx-auto w-full">
-            <.dm_card variant={if message.role == :user, do: "bordered", else: "glass"} shadow="sm" class="overflow-hidden">
+            <.dm_card
+              variant={if message.role == :user, do: "bordered", else: "glass"}
+              shadow="sm"
+              class="overflow-hidden"
+            >
               <div class="flex items-start gap-4 p-4 text-on-surface">
-                <div class={"mt-1 p-2 rounded-xl #{if message.role == :user, do: "bg-primary text-primary-content", else: "bg-secondary text-secondary-content"}"}>
+                <div class={
+                  "mt-1 p-2 rounded-xl #{if message.role == :user, do: "bg-primary text-primary-content", else: "bg-secondary text-secondary-content"}"
+                }>
                   <.dm_mdi name={if message.role == :user, do: "account", else: "robot"} class="w-5 h-5" />
                 </div>
-                <div class="flex-1 min-w-0">
+                <div class="min-w-0 flex-1">
                   <div class="flex justify-between items-center mb-1">
-                    <span class="text-xs font-bold uppercase tracking-wider opacity-60 font-mono">{message.role}</span>
-                    <span class="text-[10px] opacity-40 font-mono">{format_timestamp(message.timestamp)}</span>
+                    <span class="text-xs font-bold uppercase tracking-wider opacity-60 font-mono">
+                      {message.role}
+                    </span>
+                    <span class="text-[10px] opacity-40 font-mono">
+                      {format_timestamp(message.timestamp)}
+                    </span>
                   </div>
                   <div class="content whitespace-pre-wrap font-sans text-base leading-relaxed">
                     {render_content(message.content)}
@@ -140,7 +162,7 @@ defmodule ExPiWeb.SessionLive do
                   autocomplete="off"
                 />
                 <div class="absolute right-2 top-1/2 -translate-y-1/2">
-                  <.dm_btn type="submit" variant="ghost" shape="circle" size="sm">
+                  <.dm_btn id="send-prompt-btn" type="submit" variant="ghost" shape="circle" size="sm">
                     <.dm_mdi name="send" class="text-primary w-5 h-5" />
                   </.dm_btn>
                 </div>
@@ -166,13 +188,27 @@ defmodule ExPiWeb.SessionLive do
             The agent is requesting permission to execute a <span class="font-bold">{@permission_request.tool_call.name}</span> command.
           </p>
           <div class="bg-surface-container-high p-4 rounded-xl border border-outline-variant text-on-surface">
-             <p class="text-xs uppercase tracking-widest font-bold opacity-50 mb-2">Arguments</p>
-             <pre class="overflow-x-auto text-sm font-mono leading-relaxed">{Jason.encode!(@permission_request.tool_call.arguments, pretty: true)}</pre>
+            <p class="text-xs uppercase tracking-widest font-bold opacity-50 mb-2">Arguments</p>
+            <pre class="overflow-x-auto text-sm font-mono leading-relaxed">{Jason.encode!(@permission_request.tool_call.arguments, pretty: true)}</pre>
           </div>
         </:body>
         <:footer>
-          <.dm_btn phx-click="permission_deny" variant="ghost">Deny</.dm_btn>
-          <.dm_btn phx-click="permission_allow" variant="primary">Authorize Execution</.dm_btn>
+          <.dm_btn
+            id="deny-permission-btn"
+            phx-click="permission_deny"
+            phx-hook="WebComponentHook"
+            variant="ghost"
+          >
+            Deny
+          </.dm_btn>
+          <.dm_btn
+            id="allow-permission-btn"
+            phx-click="permission_allow"
+            phx-hook="WebComponentHook"
+            variant="primary"
+          >
+            Authorize Execution
+          </.dm_btn>
         </:footer>
       </.dm_modal>
     </div>
@@ -180,6 +216,7 @@ defmodule ExPiWeb.SessionLive do
   end
 
   defp render_content(content) when is_binary(content), do: content
+
   defp render_content(content) when is_list(content) do
     Enum.map(content, fn
       %{type: :text, text: text} -> text
@@ -193,6 +230,7 @@ defmodule ExPiWeb.SessionLive do
   defp format_timestamp(ts) when is_integer(ts) do
     ts |> DateTime.from_unix!(:millisecond) |> Calendar.strftime("%H:%M:%S")
   end
+
   defp format_timestamp(_), do: ""
 
   @impl true

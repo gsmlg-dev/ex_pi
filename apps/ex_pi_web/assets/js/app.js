@@ -4,9 +4,16 @@ import {LiveSocket} from "phoenix_live_view"
 import topbar from "topbar"
 import * as DuskmoonHooks from "phoenix_duskmoon/hooks"
 
-import "@duskmoon-dev/elements/register"
+import "@duskmoon-dev/el-button/register"
+import "@duskmoon-dev/el-card/register"
+import "@duskmoon-dev/el-dialog/register"
+import "@duskmoon-dev/el-input/register"
+import "@duskmoon-dev/el-menu/register"
+import "@duskmoon-dev/el-badge/register"
+import "@duskmoon-dev/el-chip/register"
 
 let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
+
 let liveSocket = new LiveSocket("/live", Socket, {
   params: {_csrf_token: csrfToken},
   hooks: DuskmoonHooks

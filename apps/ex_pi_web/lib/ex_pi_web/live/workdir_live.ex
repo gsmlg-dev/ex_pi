@@ -3,13 +3,8 @@ defmodule ExPiWeb.WorkdirLive do
 
   @impl true
   def mount(%{"workdir" => encoded_workdir}, _session, socket) do
-    IO.inspect(encoded_workdir, label: "WorkdirLive.mount: encoded_workdir")
     workdir = Base.url_decode64!(encoded_workdir, padding: false)
-    IO.inspect(workdir, label: "WorkdirLive.mount: decoded workdir")
-    
     sessions_dir = get_sessions_dir(workdir)
-    IO.inspect(sessions_dir, label: "WorkdirLive.mount: sessions_dir")
-    
     File.mkdir_p!(sessions_dir)
 
     {:ok, sessions} = ExPiSession.Log.list_sessions(sessions_dir)
@@ -41,7 +36,13 @@ defmodule ExPiWeb.WorkdirLive do
           <.dm_left_menu_group id="actions">
             <:title>Actions</:title>
             <div class="p-2">
-              <.dm_btn phx-click="new_session" variant="primary" class="w-full mb-4">
+              <.dm_btn
+                id="new-session-btn"
+                phx-click="new_session"
+                phx-hook="WebComponentHook"
+                variant="primary"
+                class="w-full mb-4"
+              >
                 <:prefix><.dm_mdi name="plus" /></:prefix>
                 New Session
               </.dm_btn>
@@ -65,26 +66,40 @@ defmodule ExPiWeb.WorkdirLive do
             </div>
           </div>
 
-          <div :if={Enum.empty?(@sessions)} class="text-center py-20 bg-surface-container-low rounded-3xl border-2 border-dashed border-outline-variant">
+          <div
+            :if={Enum.empty?(@sessions)}
+            class="text-center py-20 bg-surface-container-low rounded-3xl border-2 border-dashed border-outline-variant"
+          >
             <.dm_mdi name="message-off-outline" class="w-12 h-12 mx-auto text-on-surface-variant mb-4 opacity-40" />
             <h3 class="text-xl font-semibold text-on-surface">No sessions yet</h3>
             <p class="text-on-surface-variant mt-2 max-w-sm mx-auto">
               Start your first session to begin collaborating with π on this project.
             </p>
-            <.dm_btn phx-click="new_session" variant="primary" size="lg" class="mt-8">
+            <.dm_btn
+              id="start-first-session-btn"
+              phx-click="new_session"
+              phx-hook="WebComponentHook"
+              variant="primary"
+              size="lg"
+              class="mt-8"
+            >
               Start First Session
             </.dm_btn>
           </div>
 
           <div :if={!Enum.empty?(@sessions)} class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            <.dm_card :for={s <- @sessions} variant="bordered" class="group interactive hover:shadow-lg transition-all duration-200">
+            <.dm_card
+              :for={s <- @sessions}
+              variant="bordered"
+              class="group interactive hover:shadow-lg transition-all duration-200"
+            >
               <:title>
                 <div class="flex items-center gap-3 overflow-hidden text-on-surface">
                   <.dm_mdi name="chat-processing-outline" class="text-primary" />
                   <span class="truncate">{s}</span>
                 </div>
               </:title>
-              
+
               <div class="py-4">
                 <p class="text-on-surface-variant text-sm line-clamp-2 italic">
                   Session replayed from log.
@@ -92,7 +107,10 @@ defmodule ExPiWeb.WorkdirLive do
               </div>
 
               <:action>
-                <.dm_link navigate={~p"/workdir/#{@encoded_workdir}/sessions/#{s}"} class="dm-btn dm-btn--outline dm-btn--sm w-full text-center">
+                <.dm_link
+                  navigate={~p"/workdir/#{@encoded_workdir}/sessions/#{s}"}
+                  class="dm-btn dm-btn--outline dm-btn--sm w-full text-center"
+                >
                   Open
                 </.dm_link>
               </:action>
