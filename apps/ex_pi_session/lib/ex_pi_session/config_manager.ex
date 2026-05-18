@@ -208,6 +208,16 @@ defmodule ExPiSession.ConfigManager do
     |> save_config()
   end
 
+  def get_thinking_budget do
+    settings = load_json(@settings_file, %{})
+    Map.get(settings, "thinkingBudget", 0)
+  end
+
+  def set_thinking_budget(budget) when is_integer(budget) and budget >= 0 do
+    settings = load_json(@settings_file, %{})
+    save_json(@settings_file, Map.put(settings, "thinkingBudget", budget))
+  end
+
   @default_permissions %{"read" => "allow", "edit" => "ask", "bash" => "ask"}
 
   def get_permissions do

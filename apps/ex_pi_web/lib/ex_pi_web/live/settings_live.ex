@@ -86,6 +86,18 @@ defmodule ExPiWeb.SettingsLive do
               <.dm_mdi name="shield-check-outline" class="w-5 h-5" />
               <span>Permissions</span>
             </.dm_link>
+
+            <.dm_link
+              patch={~p"/settings/thinking"}
+              class={["p-4 rounded-2xl border transition-all flex items-center gap-3 font-bold",
+                if(@live_action == :thinking,
+                  do: "bg-primary text-primary-content border-primary shadow-lg",
+                  else: "bg-surface-container border-outline-variant hover:bg-surface-container-high"
+                )]}
+            >
+              <.dm_mdi name="head-cog-outline" class="w-5 h-5" />
+              <span>Thinking</span>
+            </.dm_link>
           </nav>
         </aside>
 
@@ -106,6 +118,8 @@ defmodule ExPiWeb.SettingsLive do
               <.render_system_prompt system_prompt={@config["system_prompt"]} />
             <% :permissions -> %>
               <.render_permissions permissions={@permissions} />
+            <% :thinking -> %>
+              <.render_thinking thinking_budget={@thinking_budget} />
           <% end %>
         </main>
       </div>
@@ -347,10 +361,62 @@ defmodule ExPiWeb.SettingsLive do
     {:noreply, socket |> load_config() |> put_flash(:info, "Permissions saved")}
   end
 
+  @impl true
+  def handle_event("save_thinking", %{"thinking_budget" => budget_str}, socket) do
+    budget = String.to_integer(budget_str)
+    ConfigManager.set_thinking_budget(budget)
+    {:noreply, socket |> load_config() |> put_flash(:info, "Thinking settings saved")}
+  end
+
   defp load_config(socket) do
     socket
     |> assign(:config, ConfigManager.get_config())
     |> assign(:permissions, ConfigManager.get_permissions())
+    |> assign(:thinking_budget, ConfigManager.get_thinking_budget())
+  end
+
+  defp render_thinking(assigns) do
+    ~H"""
+    <div class="space-y-6">
+      <div class="flex justify-between items-center text-on-surface">
+        <h2 class="text-2xl font-bold font-display">Extended Thinking</h2>
+      </div>
+
+      <.dm_card variant="bordered" class="bg-surface-container-low">
+        <form phx-submit="save_thinking" class="space-y-6">
+          <p class="text-sm text-on-surface-variant">
+            Extended thinking gives the model a scratchpad to reason through complex problems
+            before responding. Only supported by Anthropic providers. Set to 0 to disable.
+          </p>
+
+          <div class="space-y-1">
+            <label class="text-[10px] font-bold opacity-40 uppercase tracking-wider text-on-surface">
+              Thinking Budget (tokens)
+            </label>
+            <.dm_input
+              type="number"
+              name="thinking_budget"
+              value={@thinking_budget}
+              min="0"
+              max="100000"
+              step="1000"
+              class="w-full"
+              size="sm"
+            />
+            <p class="text-xs text-on-surface-variant mt-1">
+              Recommended: 10000–20000. Must be less than max_tokens. 0 = disabled.
+            </p>
+          </div>
+
+          <div class="flex justify-end pt-4 border-t border-outline-variant">
+            <.dm_btn type="submit" phx-hook="WebComponentHook" variant="primary" size="md">
+              Save
+            </.dm_btn>
+          </div>
+        </form>
+      </.dm_card>
+    </div>
+    """
   end
 
   defp render_permissions(assigns) do

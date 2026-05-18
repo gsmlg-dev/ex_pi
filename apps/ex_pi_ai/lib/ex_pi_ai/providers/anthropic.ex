@@ -10,7 +10,9 @@ defmodule ExPiAi.Providers.Anthropic do
     options = params.options
 
     api_key = options[:api_key] || System.get_env("ANTHROPIC_AUTH_TOKEN")
-    base_url = options[:base_url] || System.get_env("ANTHROPIC_BASE_URL") || "https://api.anthropic.com"
+
+    base_url =
+      options[:base_url] || System.get_env("ANTHROPIC_BASE_URL") || "https://api.anthropic.com"
 
     body = %{
       model: model.id,
@@ -21,13 +23,30 @@ defmodule ExPiAi.Providers.Anthropic do
     }
 
     # Add tools if present
-    body = if context[:tools], do: Map.put(body, :tools, transform_tools(context.tools)), else: body
+    body =
+      if context[:tools], do: Map.put(body, :tools, transform_tools(context.tools)), else: body
 
-    headers = [
-      {"x-api-key", api_key},
-      {"anthropic-version", "2023-06-01"},
-      {"content-type", "application/json"}
-    ]
+    # Enable extended thinking when budget is set
+    {body, thinking_headers} =
+      case options[:thinking_budget] do
+        budget when is_integer(budget) and budget > 0 ->
+          body =
+            body
+            |> Map.put(:thinking, %{type: "enabled", budget_tokens: budget})
+            |> Map.update!(:max_tokens, &max(&1, budget + 1000))
+
+          {body, [{"anthropic-beta", "interleaved-thinking-2025-05-14"}]}
+
+        _ ->
+          {body, []}
+      end
+
+    headers =
+      [
+        {"x-api-key", api_key},
+        {"anthropic-version", "2023-06-01"},
+        {"content-type", "application/json"}
+      ] ++ thinking_headers
 
     Elixir.Stream.resource(
       fn ->
@@ -40,6 +59,7 @@ defmodule ExPiAi.Providers.Anthropic do
             {:cont, {req, resp}}
           end
         )
+
         {_initial_assistant_message(model), ""}
       end,
       fn {message, buffer} ->
@@ -111,9 +131,21 @@ defmodule ExPiAi.Providers.Anthropic do
 
   defp transform_content(content) do
     Enum.map(content, fn
-      %{type: :text, text: text} -> %{type: "text", text: text}
-      %{type: :thinking, thinking: thinking} -> %{type: "thinking", thinking: thinking}
-      %{type: :tool_call} = tc -> %{type: "tool_use", id: tc.id, name: tc.name, input: tc.arguments}
+      %{type: :text, text: text} ->
+        %{type: "text", text: text}
+
+      %{type: :thinking} = block ->
+        sig = block[:thinking_signature]
+
+        if is_binary(sig) and sig != "" do
+          %{type: "thinking", thinking: block.thinking, signature: sig}
+        else
+          # No signature — fallback to text to avoid API rejection on replay
+          %{type: "text", text: block.thinking}
+        end
+
+      %{type: :tool_call} = tc ->
+        %{type: "tool_use", id: tc.id, name: tc.name, input: tc.arguments}
     end)
   end
 
@@ -135,12 +167,22 @@ defmodule ExPiAi.Providers.Anthropic do
           {{:start, new_acc}, new_acc}
 
         %{"type" => "content_block_start", "index" => idx, "content_block" => block} ->
-          result = case block["type"] do
-            "text" -> {:text, %{type: :text, text: ""}, :text_start}
-            "thinking" -> {:thinking, %{type: :thinking, thinking: ""}, :thinking_start}
-            "tool_use" -> {:tool_call, %{type: :tool_call, id: block["id"], name: block["name"], partial_json: ""}, :toolcall_start}
-            _ -> nil
-          end
+          result =
+            case block["type"] do
+              "text" ->
+                {:text, %{type: :text, text: ""}, :text_start}
+
+              "thinking" ->
+                {:thinking, %{type: :thinking, thinking: ""}, :thinking_start}
+
+              "tool_use" ->
+                {:tool_call,
+                 %{type: :tool_call, id: block["id"], name: block["name"], partial_json: ""},
+                 :toolcall_start}
+
+              _ ->
+                nil
+            end
 
           if result do
             {_type, initial_block, event_type} = result
@@ -156,62 +198,104 @@ defmodule ExPiAi.Providers.Anthropic do
             "text_delta" ->
               text = delta["text"]
               # Update content at idx
-              new_content = update_content(acc.content, idx, fn block ->
-                %{block | text: (block[:text] || "") <> text}
-              end)
+              new_content =
+                update_content(acc.content, idx, fn block ->
+                  %{block | text: (block[:text] || "") <> text}
+                end)
+
               new_acc = %{acc | content: new_content}
               {{:text_delta, idx, text, new_acc}, new_acc}
 
             "thinking_delta" ->
               thinking = delta["thinking"]
-              new_content = update_content(acc.content, idx, fn block ->
-                %{block | thinking: (block[:thinking] || "") <> thinking}
-              end)
+
+              new_content =
+                update_content(acc.content, idx, fn block ->
+                  %{block | thinking: (block[:thinking] || "") <> thinking}
+                end)
+
               new_acc = %{acc | content: new_content}
               {{:thinking_delta, idx, thinking, new_acc}, new_acc}
 
             "input_json_delta" ->
               partial_json = delta["partial_json"]
               # For tool call, we accumulate JSON
-              new_content = update_content(acc.content, idx, fn block ->
-                %{block | partial_json: (block[:partial_json] || "") <> partial_json}
-              end)
+              new_content =
+                update_content(acc.content, idx, fn block ->
+                  %{block | partial_json: (block[:partial_json] || "") <> partial_json}
+                end)
+
               new_acc = %{acc | content: new_content}
               {{:toolcall_delta, idx, partial_json, new_acc}, new_acc}
-            
-            _ -> {nil, acc}
+
+            "signature_delta" ->
+              signature = delta["signature"]
+
+              new_content =
+                update_content(acc.content, idx, fn block ->
+                  Map.put(
+                    block,
+                    :thinking_signature,
+                    (block[:thinking_signature] || "") <> signature
+                  )
+                end)
+
+              new_acc = %{acc | content: new_content}
+              {nil, new_acc}
+
+            _ ->
+              {nil, acc}
           end
 
         %{"type" => "content_block_stop", "index" => idx} ->
           # Finalize block
           block = Enum.at(acc.content, idx)
+
           if block do
             case block.type do
-              :text -> {{:text_end, idx, block.text, acc}, acc}
-              :thinking -> {{:thinking_end, idx, block.thinking, acc}, acc}
+              :text ->
+                {{:text_end, idx, block.text, acc}, acc}
+
+              :thinking ->
+                final_block = %{
+                  type: :thinking,
+                  thinking: block.thinking,
+                  thinking_signature: block[:thinking_signature]
+                }
+
+                new_content = List.replace_at(acc.content, idx, final_block)
+                new_acc = %{acc | content: new_content}
+                {{:thinking_end, idx, block.thinking, new_acc}, new_acc}
+
               :tool_call ->
                 # Parse JSON
-                args = case Jason.decode(block.partial_json) do
-                  {:ok, decoded} -> decoded
-                  _ -> %{}
-                end
+                args =
+                  case Jason.decode(block.partial_json) do
+                    {:ok, decoded} -> decoded
+                    _ -> %{}
+                  end
+
                 tool_call = %{type: :tool_call, id: block.id, name: block.name, arguments: args}
                 new_content = List.replace_at(acc.content, idx, tool_call)
                 new_acc = %{acc | content: new_content}
                 {{:toolcall_end, idx, tool_call, new_acc}, new_acc}
-              _ -> {nil, acc}
+
+              _ ->
+                {nil, acc}
             end
           else
             {nil, acc}
           end
 
         %{"type" => "message_delta", "delta" => delta, "usage" => usage} ->
-          stop_reason = case delta["stop_reason"] do
-            "end_turn" -> :stop
-            "max_tokens" -> :length
-            "tool_use" -> :tool_use
-            _ -> nil
-          end
+          stop_reason =
+            case delta["stop_reason"] do
+              "end_turn" -> :stop
+              "max_tokens" -> :length
+              "tool_use" -> :tool_use
+              _ -> nil
+            end
+
           new_acc = %{acc | stop_reason: stop_reason, usage: transform_usage(usage)}
           # We don't emit a separate event for message_delta usually, 
           # but we wait for message_stop or done?
@@ -221,7 +305,8 @@ defmodule ExPiAi.Providers.Anthropic do
         %{"type" => "message_stop"} ->
           {{:done, acc.stop_reason, acc}, acc}
 
-        _ -> {nil, acc}
+        _ ->
+          {nil, acc}
       end
     end)
     |> then(fn {events, acc} -> {Enum.reject(events, &is_nil/1), acc} end)

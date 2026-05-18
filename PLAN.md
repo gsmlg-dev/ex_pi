@@ -101,6 +101,11 @@
 - **E.1: Should glob, grep, and ls be implemented as separate tools or unified into a single search tool?**
   Separate tools, matching pi's own `find`, `grep`, and `ls` modules exactly. Each tool has a distinct affordance the LLM chooses between: `glob` returns matching file paths (no content); `grep` returns matching lines with `file:line:` prefixes (content, no directory tree); `ls` returns a flat directory listing with `[dir]`/`[file]` tags. A unified "search" tool would force the LLM to specify which operation it wants via a mode parameter, adding friction and diluting the schema descriptions. All three are read-only so they default to `:allow` under the existing permission system — no policy changes needed. `grep`'s `collect_files` uses both `glob_filter` and `"**/" <> glob_filter` patterns to correctly match files at the root level as well as subdirectories, working around Erlang's `:filelib.wildcard` treatment of `**` (which may not match zero directory components in all Elixir versions).
 
+### Phase F — Extended thinking mode
+
+- **F.1: Should thinking_budget be per-session or global, and how is it persisted?**
+  Global (settings.json). A per-session knob would require a UI element in the session view (cluttering the chat) or a JSONL session header field (adding replay complexity). Since extended thinking is a model-capability preference rather than a per-task one, storing it globally in `settings.json` as `"thinkingBudget"` matches the precedent set by `"permissions"`. `ConfigManager.get_thinking_budget/0` reads it and returns 0 as the off default; `set_thinking_budget/1` patches only that key. `SessionLive` reads it at mount time and passes it as `options: [thinking_budget: budget]`. The Anthropic provider checks `options[:thinking_budget]` before building the request body — zero means no thinking params are added at all, so non-Anthropic providers are unaffected. `transform_content/1` accumulates `signature_delta` events into a `thinking_signature` field on each thinking block during streaming; `content_block_stop` finalizes the block preserving the signature so that if thinking blocks appear in the conversation context on the next turn, they are sent back with their signature intact (required by the Anthropic API). When signature is missing or empty, the block degrades to a plain text block to avoid API rejection.
+
 ### Phase D — Context compaction
 
 - **D.1: Should compaction trigger automatically on a token threshold, or only when the user clicks a button?**
@@ -118,6 +123,7 @@
 - [x] Phase C — Streaming UX (C.1–C.3)
 - [x] Phase D — Context compaction (D.1)
 - [x] Phase E — Navigation tools (E.1)
+- [x] Phase F — Extended thinking mode (F.1)
 
 ## Phase A Summary
 

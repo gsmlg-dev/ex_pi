@@ -46,11 +46,13 @@ defmodule ExPiWeb.SessionLive do
           Phoenix.PubSub.broadcast(ExPiWeb.PubSub, "session:#{session_id}", event)
         end
 
+        thinking_budget = ConfigManager.get_thinking_budget()
+
         {:ok, {agent, _policy}} =
           ExPiWeb.SessionManager.get_agent(session_id,
             model: %{id: model_id, api: provider_id, provider: provider_id},
             provider: provider_mod,
-            options: [api_key: api_key, base_url: base_url],
+            options: [api_key: api_key, base_url: base_url, thinking_budget: thinking_budget],
             system_prompt: system_prompt,
             on_event: on_event,
             tools: [
