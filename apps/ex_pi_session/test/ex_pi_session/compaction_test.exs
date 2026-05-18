@@ -14,7 +14,7 @@ defmodule ExPiSession.CompactionTest do
 
   test "compact appends entry and replay handles it" do
     # 1. Create session with some messages
-    Log.persist_event(@test_storage, {:agent_start})
+    Log.persist_event(@test_storage, {:agent_start, "/tmp"})
     msg1 = Message.user("m1", "hello")
     Log.persist_event(@test_storage, {:message_end, msg1})
     msg2 = Message.assistant("m2", %{content: "hi"})
@@ -40,7 +40,7 @@ defmodule ExPiSession.CompactionTest do
   end
 
   test "multiple compactions" do
-    Log.persist_event(@test_storage, {:agent_start})
+    Log.persist_event(@test_storage, {:agent_start, "/tmp"})
     Log.persist_event(@test_storage, {:message_end, Message.user("m1", "1")})
     Log.persist_event(@test_storage, {:message_end, Message.user("m2", "2")})
     

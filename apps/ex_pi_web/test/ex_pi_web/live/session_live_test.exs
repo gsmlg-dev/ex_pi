@@ -22,7 +22,7 @@ defmodule ExPiWeb.SessionLiveTest do
     
     render_submit(view, "send_prompt", %{"prompt" => "hello"})
     
-    assert_receive {:agent_start}, 2000
+    assert_receive {:agent_start, _}, 2000
     assert_receive {:turn_start}, 2000
     assert_receive {:message_start, %{role: :user, content: "hello"}}, 2000
     assert_receive {:message_end, %{role: :assistant}}, 2000

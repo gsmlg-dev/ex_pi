@@ -82,7 +82,7 @@ defmodule ExPiCoding.IntegrationTest do
     ExPiAgent.prompt(agent, "Read hello.txt")
 
     # Turn 1
-    assert_receive {:agent_start}
+    assert_receive {:agent_start, _}
     assert_receive {:turn_start}
     assert_receive {:tool_execution_start, "tc1", "read", _}
     

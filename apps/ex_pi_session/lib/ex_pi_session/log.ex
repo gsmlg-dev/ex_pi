@@ -81,7 +81,7 @@ defmodule ExPiSession.Log do
   @doc """
   Forks a session at the given index.
   """
-  def fork(source_storage_id, target_storage_id, index, storage_mod \\ JsonlFile) do
+  def fork(source_storage_id, target_storage_id, index, cwd, storage_mod \\ JsonlFile) do
     case storage_mod.read(source_storage_id) do
       {:ok, entries} ->
         # index is message index, but entries include header.
@@ -99,7 +99,7 @@ defmodule ExPiSession.Log do
           "version" => 3,
           "id" => new_session_id,
           "timestamp" => DateTime.utc_now() |> DateTime.to_iso8601(),
-          "cwd" => File.cwd!(),
+          "cwd" => cwd,
           "parentSession" => parent_id
         }
 
@@ -160,8 +160,7 @@ defmodule ExPiSession.Log do
 
         {:ok, entry}
 
-      {:agent_start} ->
-        # Check if header exists
+      {:agent_start, cwd} ->
         case storage_mod.read(storage_id) do
           {:ok, entries} ->
             if Enum.any?(entries, fn e -> e["type"] == "session" end) do
@@ -172,7 +171,7 @@ defmodule ExPiSession.Log do
                 "version" => 3,
                 "id" => generate_session_id(),
                 "timestamp" => DateTime.utc_now() |> DateTime.to_iso8601(),
-                "cwd" => File.cwd!()
+                "cwd" => cwd
               }
 
               {:ok, header}

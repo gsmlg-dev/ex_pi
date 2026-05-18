@@ -8,9 +8,11 @@ defmodule ExPiSession.IntegrationTest do
 
   setup do
     File.mkdir_p!(@test_dir)
+
     on_exit(fn ->
       File.rm_rf!(@test_dir)
     end)
+
     :ok
   end
 
@@ -18,7 +20,7 @@ defmodule ExPiSession.IntegrationTest do
     def stream(params) do
       prompt = get_last_user_prompt(params.context.messages)
       content = "Response to: #{prompt}"
-      
+
       initial_msg = %{
         role: :assistant,
         content: [],
@@ -38,7 +40,12 @@ defmodule ExPiSession.IntegrationTest do
       }
 
       delta_msg = %{initial_msg | content: [%{type: :text, text: content}]}
-      done_msg = %{delta_msg | stop_reason: :stop, usage: %{delta_msg.usage | output: 1, total_tokens: 11}}
+
+      done_msg = %{
+        delta_msg
+        | stop_reason: :stop,
+          usage: %{delta_msg.usage | output: 1, total_tokens: 11}
+      }
 
       [
         {:start, initial_msg},
@@ -52,8 +59,10 @@ defmodule ExPiSession.IntegrationTest do
       |> Enum.reverse()
       |> Enum.find(fn m -> m.role == :user end)
       |> case do
-        nil -> "None"
-        m -> 
+        nil ->
+          "None"
+
+        m ->
           case m.content do
             [%{text: text} | _] -> text
             text when is_binary(text) -> text
@@ -65,7 +74,7 @@ defmodule ExPiSession.IntegrationTest do
 
   defp run_turn(agent, storage_id, prompt) do
     ExPiAgent.prompt(agent, prompt)
-    
+
     consume_events(storage_id)
   end
 
@@ -74,6 +83,7 @@ defmodule ExPiSession.IntegrationTest do
       {:agent_end, _messages} = event ->
         Log.persist_event(storage_id, event)
         :ok
+
       event ->
         Log.persist_event(storage_id, event)
         consume_events(storage_id)
@@ -100,7 +110,7 @@ defmodule ExPiSession.IntegrationTest do
       {:ok, agent1} = ExPiAgent.start_link(model: model, provider: MockProvider)
       ExPiAgent.subscribe(agent1)
       run_turn(agent1, storage_id, "Hello 1")
-      
+
       # Stop the agent (simulate crash)
       GenServer.stop(agent1)
 
@@ -111,16 +121,18 @@ defmodule ExPiSession.IntegrationTest do
       assert get_content(Enum.at(replayed_messages, 1)) == "Response to: Hello 1"
 
       # 3. Restart new agent with replayed messages
-      {:ok, agent2} = ExPiAgent.start_link(
-        model: model, 
-        provider: MockProvider, 
-        messages: replayed_messages
-      )
+      {:ok, agent2} =
+        ExPiAgent.start_link(
+          model: model,
+          provider: MockProvider,
+          messages: replayed_messages
+        )
+
       ExPiAgent.subscribe(agent2)
-      
+
       # 4. Verify it continues correctly
       run_turn(agent2, storage_id, "Hello 2")
-      
+
       {:ok, final_messages} = Log.replay(storage_id)
       assert length(final_messages) == 4
       assert Enum.at(final_messages, 2).content == "Hello 2"
@@ -155,22 +167,25 @@ defmodule ExPiSession.IntegrationTest do
       # Entry 4: Message Response P2 (assistant)
       # Wait, Log.replay filters out session header for the returned messages.
       # But fork takes index of ALL entries.
-      
+
       {:ok, _entries} = JsonlFile.read(parent_storage_id)
       # entries: [Header, Msg1, Msg2, Msg3, Msg4, Msg5, Msg6]
       # Let's fork after the 4th message (Msg4), so index 4.
-      {:ok, _branch_id} = Log.fork(parent_storage_id, branch_storage_id, 4)
+      {:ok, _branch_id} = Log.fork(parent_storage_id, branch_storage_id, 4, "/tmp")
 
       # 3. Advance both branches independently
       run_turn(parent_agent, parent_storage_id, "P4")
 
       {:ok, replayed_branch} = Log.replay(branch_storage_id)
       assert length(replayed_branch) == 4
-      {:ok, branch_agent} = ExPiAgent.start_link(
-        model: model,
-        provider: MockProvider,
-        messages: replayed_branch
-      )
+
+      {:ok, branch_agent} =
+        ExPiAgent.start_link(
+          model: model,
+          provider: MockProvider,
+          messages: replayed_branch
+        )
+
       ExPiAgent.subscribe(branch_agent)
       run_turn(branch_agent, branch_storage_id, "B3")
 
@@ -199,11 +214,11 @@ defmodule ExPiSession.IntegrationTest do
       {:ok, parent_agent} = ExPiAgent.start_link(model: model, provider: MockProvider)
       ExPiAgent.subscribe(parent_agent)
       run_turn(parent_agent, parent_storage_id, "P1")
-      
+
       {:ok, parent_entries_before} = File.read(parent_storage_id)
 
-      {:ok, _branch_id} = Log.fork(parent_storage_id, branch_storage_id, 2)
-      
+      {:ok, _branch_id} = Log.fork(parent_storage_id, branch_storage_id, 2, "/tmp")
+
       # 2. Compact the fork
       {:ok, branch_messages} = Log.replay(branch_storage_id)
       last_msg_id = List.last(branch_messages).id

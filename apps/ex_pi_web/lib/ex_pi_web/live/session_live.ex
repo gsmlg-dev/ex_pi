@@ -281,7 +281,7 @@ defmodule ExPiWeb.SessionLive do
 
     # Fork the log (take all current messages)
     {:ok, messages} = ExPiSession.Log.replay(source_path)
-    ExPiSession.Log.fork(source_path, target_path, length(messages))
+    ExPiSession.Log.fork(source_path, target_path, length(messages), socket.assigns.workdir)
 
     {:noreply,
      push_navigate(socket,
@@ -318,7 +318,7 @@ defmodule ExPiWeb.SessionLive do
   end
 
   @impl true
-  def handle_info({:agent_start}, socket) do
+  def handle_info({:agent_start, _cwd}, socket) do
     {:noreply, assign(socket, :turn_in_flight, true)}
   end
 

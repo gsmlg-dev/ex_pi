@@ -48,7 +48,7 @@ defmodule ExPiAgentTest do
 
     ExPiAgent.prompt(agent, "Hi")
 
-    assert_receive {:agent_start}
+    assert_receive {:agent_start, _}
     assert_receive {:message_start, %Message{role: :user, content: "Hi"}}
     assert_receive {:message_end, %Message{role: :user}}
 

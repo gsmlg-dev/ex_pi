@@ -14,7 +14,7 @@ defmodule ExPiSession.LogTest do
 
   test "persists agent_start (header) and message_end events" do
     # 1. Persist agent_start
-    assert :ok == Log.persist_event(@storage_path, {:agent_start})
+    assert :ok == Log.persist_event(@storage_path, {:agent_start, "/tmp"})
 
     # 2. Persist a message
     msg = Message.user("user_1", "Hello")
@@ -30,7 +30,7 @@ defmodule ExPiSession.LogTest do
   end
 
   test "maintains parentId in linear fashion" do
-    Log.persist_event(@storage_path, {:agent_start})
+    Log.persist_event(@storage_path, {:agent_start, "/tmp"})
 
     msg1 = Message.user("user_1", "One")
     Log.persist_event(@storage_path, {:message_end, msg1})
@@ -52,7 +52,7 @@ defmodule ExPiSession.LogTest do
   end
 
   test "reconstructs complex assistant messages" do
-    Log.persist_event(@storage_path, {:agent_start})
+    Log.persist_event(@storage_path, {:agent_start, "/tmp"})
 
     msg = %Message{
       id: "assistant_1",

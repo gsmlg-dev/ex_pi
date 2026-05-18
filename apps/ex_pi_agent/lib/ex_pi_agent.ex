@@ -156,7 +156,7 @@ defmodule ExPiAgent do
   # Internal — runs inside the turn Task
 
   defp execute_turn(state, prompt_text) do
-    emit(state, {:agent_start})
+    emit(state, {:agent_start, state.cwd})
 
     user_id = "msg_user_#{System.unique_integer([:positive])}"
     user_msg = Message.user(user_id, prompt_text)

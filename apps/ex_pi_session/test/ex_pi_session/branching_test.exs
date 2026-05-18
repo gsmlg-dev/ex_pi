@@ -16,7 +16,7 @@ defmodule ExPiSession.BranchingTest do
 
   test "fork copies prefix and appends new header" do
     # 1. Create source session
-    Log.persist_event(@test_storage, {:agent_start})
+    Log.persist_event(@test_storage, {:agent_start, "/tmp"})
     msg1 = Message.user("m1", "hello")
     Log.persist_event(@test_storage, {:message_end, msg1})
     msg2 = Message.assistant("m2", %{content: "hi"})
@@ -27,11 +27,11 @@ defmodule ExPiSession.BranchingTest do
     # 2. Fork at index 1 (session header + msg1)
     # entries: [session_header, m1, m2, m3]
     # index 1 means [session_header, m1]
-    {:ok, new_session_id} = Log.fork(@test_storage, @target_storage, 1)
+    {:ok, new_session_id} = Log.fork(@test_storage, @target_storage, 1, "/tmp")
 
     # 3. Check target storage
     {:ok, target_entries} = ExPiSession.Storage.JsonlFile.read(@target_storage)
-    
+
     assert Enum.count(target_entries) == 3
     assert Enum.at(target_entries, 0)["type"] == "session"
     assert Enum.at(target_entries, 1)["type"] == "message"
