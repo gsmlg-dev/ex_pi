@@ -62,6 +62,15 @@
 - **A.3: Where should per-tool permission defaults live — code or config?**
   Config. The hardcoded `default_permissions/0` in `ExPiAgent` was a temporary fallback that couldn't be changed without recompiling. Moving defaults to `settings.json` (via `ConfigManager.get_permissions/0`) lets non-technical users change the policy from the Settings UI without touching code. The rules map is loaded at mount time in `SessionLive` and passed as `permission_rules:` to the agent — each session gets a fresh `PermissionPolicy` GenServer initialized from the current saved defaults. The format on disk is string-valued (`"allow"`, `"ask"`, `"deny"`) to keep the JSON human-readable; conversion to atoms happens in `get_permissions/0` using `String.to_existing_atom/1`, which is safe because the allowed values are a closed set of known atoms.
 
+- **A.5c: Does `Log.fork` count message entries or raw entry positions?**
+  Message entries only. The original `Enum.take(entries, index + 1)` counted by raw position — correct only when the log contains no entries between messages (no compaction, no future entry types). The fix is `take_through_nth_message/2`, which walks the entries list accumulating all non-message entries unconditionally but stops after seeing `n` message entries. The companion `fork_at_message/5` accepts either a message ID or `:all`; it computes the count by scanning message entries before the target ID, adding 1 to include it. The per-message fork button in `SessionLive` calls `fork_at` with `phx-value-msg-id`, keeping the LiveView handler trivially thin. The "fork all" button now also routes through `fork_at_message(…, :all, …)` so both paths share the same counting logic.
+
+- **A.5b: Should `{:agent_start}` carry the cwd so `log.ex` avoids `File.cwd!`?**
+  Yes. `File.cwd!` in `event_to_entry` returned the OS process cwd, which is the umbrella root — not the session's working directory. The agent already knows the correct cwd at init time and stores it in `state.cwd`. Changing the tuple to `{:agent_start, cwd}` passes that value through without any extra I/O. `Log.fork/5` was similarly extended to take an explicit `cwd` argument so the forked session header records the correct directory without any implicit file-system calls.
+
+- **A.5a: Does safe_resolve block symlinks that escape the cwd?**
+  The original `safe_resolve/2` used `Path.expand`, which resolves `.` and `..` in the string but does NOT follow symlinks. A symlink at `<cwd>/evil -> /etc/passwd` would pass the `within_cwd?` check — the symlink file is inside cwd — but any tool that opens it would reach `/etc/passwd`. The fix: `resolve_real_path/2` walks the full path with `File.read_link/1` at each level (up to 40 hops before returning `:symlink_loop`). For paths that don't yet exist, it walks up to the nearest existing parent. Both the input path AND the cwd are resolved before the prefix check, so macOS's `/tmp → /private/tmp` indirection doesn't cause false rejections. The resolved symlink target is returned as the real path for the within-cwd comparison, but the original non-resolved path is returned to callers so they get the path they asked for.
+
 ## Progress
 
 - [x] Stage 1 — `ex_pi_ai`
@@ -69,3 +78,12 @@
 - [x] Stage 3 — `ex_pi_session`
 - [x] Stage 4 — `ex_pi_coding`
 - [x] Stage 5 — `ex_pi_web`
+- [x] Phase A — Daily-use blockers (A.1–A.5c)
+
+## Phase A Summary
+
+Seven commits landed across all five umbrella apps. The agent's turn execution now runs in a supervised task with `async_nolink`, so provider crashes cannot kill the GenServer — `run_stream/2` rescues `RuntimeError` and `Jason.DecodeError` and converts them to a clean `{:turn_error, reason}` event, while unexpected panics are caught by the `{:DOWN}` path. The `ExPiAgent` child spec overrides `restart: :temporary` so a crashed agent stays dead rather than reviving with a stale `on_event` closure; `SessionManager` evicts the dead entry on `:DOWN` and the LiveView shows a flash banner pointing the user to the preserved on-disk history. The `PermissionPolicy` GenServer is now started with `start_link` inside `ExPiAgent.init`, linking it to the agent so it dies automatically when the agent is killed.
+
+Permission defaults were moved out of hardcoded Elixir into `settings.json`. `ConfigManager.get_permissions/0` reads the `"permissions"` key, converts string values to atoms with `String.to_existing_atom/1` (safe because the valid values are a closed set), and returns the map for the mount-time rules. A Settings → Permissions page with radio groups lets users toggle read/edit/bash policies without touching code. Each new session gets a fresh `PermissionPolicy` initialized from those saved defaults.
+
+The symlink escape hole in `safe_resolve/2` was closed by replacing `Path.expand` with `resolve_real_path/2`, which follows symlinks with `File.read_link/1` up to 40 hops (returning `:symlink_loop` on overflow) and resolves both the input path and the cwd before doing the prefix check — so macOS's `/tmp → /private/tmp` indirection no longer causes false rejections. The `{:agent_start}` event was changed to `{:agent_start, cwd}` so the session log writes the correct working directory without a `File.cwd!` call, and `Log.fork/5` was extended with an explicit `cwd` parameter for the same reason. Finally, `Log.fork` was fixed to count only `"message"`-typed entries when building the prefix (skipping compaction and other entry types), and a `fork_at_message/5` API plus a per-message fork button in `SessionLive` allow users to branch from any point in their session history.
