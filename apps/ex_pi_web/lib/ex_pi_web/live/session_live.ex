@@ -341,8 +341,13 @@ defmodule ExPiWeb.SessionLive do
   end
 
   @impl true
-  def handle_info({:turn_error, _reason}, socket) do
-    {:noreply, assign(socket, :turn_in_flight, false)}
+  def handle_info({:turn_error, reason}, socket) do
+    msg = if is_binary(reason), do: reason, else: inspect(reason)
+
+    {:noreply,
+     socket
+     |> put_flash(:error, "Turn failed: #{msg}")
+     |> assign(:turn_in_flight, false)}
   end
 
   @impl true

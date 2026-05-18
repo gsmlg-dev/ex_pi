@@ -214,8 +214,10 @@ defmodule ExPiSession.ConfigManager do
     settings = load_json(@settings_file, %{})
     raw = Map.get(settings, "permissions", @default_permissions)
 
+    valid = %{"allow" => :allow, "ask" => :ask, "deny" => :deny}
+
     Enum.into(raw, %{}, fn {k, v} ->
-      {k, String.to_existing_atom(v)}
+      {k, Map.get(valid, v, :ask)}
     end)
   end
 
