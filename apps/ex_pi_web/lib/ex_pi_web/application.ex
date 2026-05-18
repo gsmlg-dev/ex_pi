@@ -6,6 +6,7 @@ defmodule ExPiWeb.Application do
   def start(_type, _args) do
     children = [
       {Phoenix.PubSub, name: ExPiWeb.PubSub},
+      {DynamicSupervisor, name: ExPiWeb.AgentSupervisor, strategy: :one_for_one},
       ExPiWeb.SessionManager,
       ExPiWeb.Endpoint
     ]
