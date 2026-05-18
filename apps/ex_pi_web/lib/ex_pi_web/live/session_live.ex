@@ -195,10 +195,21 @@ defmodule ExPiWeb.SessionLive do
                       </.dm_btn>
                     </div>
                   </div>
-                  <div class={[
-                    "content whitespace-pre-wrap font-sans text-base leading-relaxed",
-                    message.is_error && "text-error"
-                  ]}>
+                  <div
+                    :if={message.role == :assistant}
+                    id={"md-#{message.id}"}
+                    phx-hook="MarkdownContent"
+                    data-content={render_content(message.content)}
+                    class="content markdown font-sans text-base leading-relaxed"
+                  >
+                  </div>
+                  <div
+                    :if={message.role != :assistant}
+                    class={[
+                      "content whitespace-pre-wrap font-sans text-base leading-relaxed",
+                      message.is_error && "text-error"
+                    ]}
+                  >
                     {render_content(message.content)}
                   </div>
                   <div

@@ -3,6 +3,8 @@ import {Socket} from "phoenix"
 import {LiveSocket} from "phoenix_live_view"
 import topbar from "topbar"
 import * as DuskmoonHooks from "phoenix_duskmoon/hooks"
+import { marked } from "marked"
+import DOMPurify from "dompurify"
 
 import "@duskmoon-dev/el-button/register"
 import "@duskmoon-dev/el-card/register"
@@ -43,11 +45,24 @@ const ScrollBottom = {
   }
 }
 
+// Parse markdown from data-content and render sanitized HTML.
+const MarkdownContent = {
+  mounted() { this.render() },
+  updated() { this.render() },
+  render() {
+    const raw = this.el.dataset.content
+    if (raw) {
+      const html = DOMPurify.sanitize(marked.parse(raw))
+      this.el.innerHTML = html
+    }
+  }
+}
+
 let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 
 let liveSocket = new LiveSocket("/live", Socket, {
   params: {_csrf_token: csrfToken},
-  hooks: { ...DuskmoonHooks, ModalHook, ScrollBottom }
+  hooks: { ...DuskmoonHooks, ModalHook, ScrollBottom, MarkdownContent }
 })
 
 // Show progress bar on live navigation and form submits
