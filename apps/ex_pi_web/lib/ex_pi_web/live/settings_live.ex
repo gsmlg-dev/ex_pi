@@ -5,8 +5,8 @@ defmodule ExPiWeb.SettingsLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    {:ok, 
-     socket 
+    {:ok,
+     socket
      |> assign(:active_tab, :settings)
      |> load_config()}
   end
@@ -14,11 +14,12 @@ defmodule ExPiWeb.SettingsLive do
   @impl true
   def handle_params(_params, _url, socket) do
     # Default to providers if root /settings is visited
-    socket = if socket.assigns.live_action == :index do
-      socket |> push_patch(to: ~p"/settings/providers")
-    else
-      socket
-    end
+    socket =
+      if socket.assigns.live_action == :index do
+        socket |> push_patch(to: ~p"/settings/providers")
+      else
+        socket
+      end
 
     {:noreply, socket |> assign(:selected_id, nil)}
   end
@@ -64,14 +65,26 @@ defmodule ExPiWeb.SettingsLive do
 
             <.dm_link
               patch={~p"/settings/system_prompt"}
-              class={["p-4 rounded-2xl border transition-all flex items-center gap-3 font-bold", 
-                if(@live_action == :system_prompt, 
-                   do: "bg-primary text-primary-content border-primary shadow-lg", 
-                   else: "bg-surface-container border-outline-variant hover:bg-surface-container-high"
+              class={["p-4 rounded-2xl border transition-all flex items-center gap-3 font-bold",
+                if(@live_action == :system_prompt,
+                  do: "bg-primary text-primary-content border-primary shadow-lg",
+                  else: "bg-surface-container border-outline-variant hover:bg-surface-container-high"
                 )]}
             >
               <.dm_mdi name="text-box-outline" class="w-5 h-5" />
               <span>System Prompt</span>
+            </.dm_link>
+
+            <.dm_link
+              patch={~p"/settings/permissions"}
+              class={["p-4 rounded-2xl border transition-all flex items-center gap-3 font-bold",
+                if(@live_action == :permissions,
+                  do: "bg-primary text-primary-content border-primary shadow-lg",
+                  else: "bg-surface-container border-outline-variant hover:bg-surface-container-high"
+                )]}
+            >
+              <.dm_mdi name="shield-check-outline" class="w-5 h-5" />
+              <span>Permissions</span>
             </.dm_link>
           </nav>
         </aside>
@@ -90,9 +103,9 @@ defmodule ExPiWeb.SettingsLive do
                 credentials={@config["credentials"]}
               />
             <% :system_prompt -> %>
-              <.render_system_prompt 
-                system_prompt={@config["system_prompt"]}
-              />
+              <.render_system_prompt system_prompt={@config["system_prompt"]} />
+            <% :permissions -> %>
+              <.render_permissions permissions={@permissions} />
           <% end %>
         </main>
       </div>
@@ -276,6 +289,7 @@ defmodule ExPiWeb.SettingsLive do
       "model" => "claude-3-5-sonnet-latest",
       "base_url" => "https://api.anthropic.com"
     })
+
     {:noreply, load_config(socket)}
   end
 
@@ -326,7 +340,61 @@ defmodule ExPiWeb.SettingsLive do
     {:noreply, socket |> load_config() |> put_flash(:info, "System prompt updated")}
   end
 
+  @impl true
+  def handle_event("save_permissions", params, socket) do
+    permissions = Map.take(params, ["read", "edit", "bash"])
+    ConfigManager.save_permissions(permissions)
+    {:noreply, socket |> load_config() |> put_flash(:info, "Permissions saved")}
+  end
+
   defp load_config(socket) do
-    assign(socket, config: ConfigManager.get_config())
+    socket
+    |> assign(:config, ConfigManager.get_config())
+    |> assign(:permissions, ConfigManager.get_permissions())
+  end
+
+  defp render_permissions(assigns) do
+    ~H"""
+    <div class="space-y-6">
+      <div class="flex justify-between items-center text-on-surface">
+        <h2 class="text-2xl font-bold font-display">Tool Permissions</h2>
+      </div>
+
+      <.dm_card variant="bordered" class="bg-surface-container-low">
+        <form phx-submit="save_permissions" class="space-y-6">
+          <p class="text-sm text-on-surface-variant">
+            Controls whether the agent executes tools automatically or asks for approval first.
+            Applied to all new sessions.
+          </p>
+
+          <%= for {tool, label} <- [{"read", "Read files"}, {"edit", "Edit files"}, {"bash", "Run bash commands"}] do %>
+            <div class="space-y-2">
+              <div class="text-sm font-bold text-on-surface">{label}</div>
+              <div class="flex gap-4">
+                <%= for {value, display} <- [{"allow", "Allow"}, {"ask", "Ask"}, {"deny", "Deny"}] do %>
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name={tool}
+                      value={value}
+                      checked={Map.get(@permissions, tool) == String.to_existing_atom(value)}
+                      class="accent-primary"
+                    />
+                    <span class="text-sm text-on-surface">{display}</span>
+                  </label>
+                <% end %>
+              </div>
+            </div>
+          <% end %>
+
+          <div class="flex justify-end pt-4 border-t border-outline-variant">
+            <.dm_btn type="submit" phx-hook="WebComponentHook" variant="primary" size="md">
+              Save Permissions
+            </.dm_btn>
+          </div>
+        </form>
+      </.dm_card>
+    </div>
+    """
   end
 end

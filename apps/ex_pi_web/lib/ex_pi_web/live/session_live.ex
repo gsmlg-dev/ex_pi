@@ -13,6 +13,7 @@ defmodule ExPiWeb.SessionLive do
     system_config = ConfigManager.get_config()
     config = ConfigManager.get_active_provider_config()
     system_prompt = Map.get(system_config, "system_prompt")
+    permission_rules = ConfigManager.get_permissions()
 
     case resolve_provider(config) do
       {:error, reason} ->
@@ -54,6 +55,7 @@ defmodule ExPiWeb.SessionLive do
             on_event: on_event,
             tools: [ExPiCoding.Tools.Read, ExPiCoding.Tools.Bash, ExPiCoding.Tools.Edit],
             dispatcher_opts: [permission_request_fn: request_fn],
+            permission_rules: permission_rules,
             messages: initial_messages,
             cwd: workdir
           )
