@@ -23,11 +23,31 @@ const ModalHook = {
   }
 };
 
+// Scroll to bottom when new stream items arrive, unless the user has scrolled up
+const ScrollBottom = {
+  mounted() {
+    this.scrollToBottom()
+    this.observer = new MutationObserver(() => {
+      if (this.isNearBottom()) this.scrollToBottom()
+    })
+    this.observer.observe(this.el, { childList: true, subtree: true })
+  },
+  destroyed() {
+    if (this.observer) this.observer.disconnect()
+  },
+  scrollToBottom() {
+    this.el.scrollTop = this.el.scrollHeight
+  },
+  isNearBottom() {
+    return this.el.scrollHeight - this.el.scrollTop - this.el.clientHeight < 300
+  }
+}
+
 let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 
 let liveSocket = new LiveSocket("/live", Socket, {
   params: {_csrf_token: csrfToken},
-  hooks: { ...DuskmoonHooks, ModalHook }
+  hooks: { ...DuskmoonHooks, ModalHook, ScrollBottom }
 })
 
 // Show progress bar on live navigation and form submits

@@ -144,7 +144,7 @@ defmodule ExPiWeb.SessionLive do
 
       <!-- Main Chat -->
       <div class="flex-1 flex flex-col min-w-0 bg-surface-container-lowest">
-        <div id="messages" phx-update="stream" class="flex-1 overflow-y-auto p-6 space-y-6">
+        <div id="messages" phx-update="stream" phx-hook="ScrollBottom" class="flex-1 overflow-y-auto p-6 space-y-6">
           <div :for={{id, message} <- @streams.messages} id={id} class="max-w-4xl mx-auto w-full">
             <.dm_card
               variant={if message.role == :user, do: "bordered", else: "glass"}
