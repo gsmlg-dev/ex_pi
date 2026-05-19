@@ -28,20 +28,27 @@ const ModalHook = {
 // Scroll to bottom when new stream items arrive, unless the user has scrolled up
 const ScrollBottom = {
   mounted() {
-    this.scrollToBottom()
+    this.atBottom = true
+    this.el.addEventListener("scroll", () => {
+      const {scrollTop, scrollHeight, clientHeight} = this.el
+      // If we are within 50px of bottom, consider it "at bottom" for stickiness
+      this.atBottom = (scrollHeight - scrollTop - clientHeight < 50)
+    })
+
     this.observer = new MutationObserver(() => {
-      if (this.isNearBottom()) this.scrollToBottom()
+      if (this.atBottom) this.scrollToBottom()
     })
     this.observer.observe(this.el, { childList: true, subtree: true })
+    this.scrollToBottom()
+  },
+  updated() {
+    if (this.atBottom) this.scrollToBottom()
   },
   destroyed() {
     if (this.observer) this.observer.disconnect()
   },
   scrollToBottom() {
-    this.el.scrollTop = this.el.scrollHeight
-  },
-  isNearBottom() {
-    return this.el.scrollHeight - this.el.scrollTop - this.el.clientHeight < 300
+    this.el.scrollTo({ top: this.el.scrollHeight, behavior: 'auto' })
   }
 }
 
