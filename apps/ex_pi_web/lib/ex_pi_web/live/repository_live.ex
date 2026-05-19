@@ -16,6 +16,7 @@ defmodule ExPiWeb.RepositoryLive do
       |> assign(:encoded_repository, encoded_repository)
       |> assign(:sessions_dir, sessions_dir)
       |> assign(:sessions, sessions)
+      |> assign(:deleting_session, nil)
 
     {:ok, socket}
   end
@@ -106,11 +107,26 @@ defmodule ExPiWeb.RepositoryLive do
               class="group interactive hover:shadow-xl transition-all duration-300 bg-surface-container-low"
             >
               <:title>
-                <div class="flex items-center gap-3 overflow-hidden text-on-surface py-1">
-                  <div class="p-2 bg-primary/10 rounded-lg text-primary group-hover:bg-primary group-hover:text-primary-content transition-colors duration-300">
-                    <.dm_mdi name="chat-processing-outline" class="w-5 h-5" />
+                <div class="flex items-center justify-between gap-3 overflow-hidden text-on-surface py-1">
+                  <div class="flex items-center gap-3 truncate min-w-0">
+                    <div class="p-2 bg-primary/10 rounded-lg text-primary group-hover:bg-primary group-hover:text-primary-content transition-colors duration-300 shrink-0">
+                      <.dm_mdi name="chat-processing-outline" class="w-5 h-5" />
+                    </div>
+                    <span class="truncate font-bold text-lg">{s}</span>
                   </div>
-                  <span class="truncate font-bold text-lg">{s}</span>
+                  <.dm_btn
+                    id={"delete-session-#{s}"}
+                    phx-click="delete_session"
+                    phx-value-id={s}
+                    phx-hook="WebComponentHook"
+                    variant="ghost"
+                    size="sm"
+                    shape="circle"
+                    class="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                    title="Delete session"
+                  >
+                    <.dm_mdi name="delete-outline" class="w-4 h-4 text-error" />
+                  </.dm_btn>
                 </div>
               </:title>
 
@@ -132,8 +148,74 @@ defmodule ExPiWeb.RepositoryLive do
           </div>
         </div>
       </main>
+
+      <!-- Delete Confirmation Modal -->
+      <.dm_modal :if={@deleting_session} id="delete-session-modal" phx-hook="ModalHook">
+        <:title>
+          <div class="flex items-center gap-2 text-error">
+            <.dm_mdi name="alert-circle-outline" class="w-6 h-6" />
+            <span>Delete Session</span>
+          </div>
+        </:title>
+        <:body>
+          <p class="text-on-surface">
+            Are you sure you want to delete the session <span class="font-bold">"{@deleting_session}"</span>?
+            This action cannot be undone and all chat history will be permanently lost.
+          </p>
+        </:body>
+        <:footer>
+          <.dm_btn
+            id="cancel-delete-btn"
+            phx-click="cancel_delete"
+            phx-hook="WebComponentHook"
+            variant="ghost"
+          >
+            Cancel
+          </.dm_btn>
+          <.dm_btn
+            id="confirm-delete-btn"
+            phx-click="confirm_delete"
+            phx-hook="WebComponentHook"
+            variant="error"
+          >
+            Delete Permanently
+          </.dm_btn>
+        </:footer>
+      </.dm_modal>
     </div>
     """
+  end
+
+  @impl true
+  def handle_event("delete_session", %{"id" => id}, socket) do
+    {:noreply, assign(socket, deleting_session: id)}
+  end
+
+  @impl true
+  def handle_event("cancel_delete", _, socket) do
+    {:noreply, assign(socket, deleting_session: nil)}
+  end
+
+  @impl true
+  def handle_event("confirm_delete", _, socket) do
+    session_id = socket.assigns.deleting_session
+    file_path = Path.join(socket.assigns.sessions_dir, "#{session_id}.jsonl")
+
+    case File.rm(file_path) do
+      :ok ->
+        {:ok, sessions} = ExPiSession.Log.list_sessions(socket.assigns.sessions_dir)
+
+        {:noreply,
+         socket
+         |> assign(sessions: sessions, deleting_session: nil)
+         |> put_flash(:info, "Session deleted successfully.")}
+
+      {:error, reason} ->
+        {:noreply,
+         socket
+         |> assign(deleting_session: nil)
+         |> put_flash(:error, "Could not delete session: #{reason}")}
+    end
   end
 
   @impl true

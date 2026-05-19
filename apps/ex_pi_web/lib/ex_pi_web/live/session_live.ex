@@ -102,7 +102,7 @@ defmodule ExPiWeb.SessionLive do
             navigate={~p"/repository/#{@encoded_repository}"}
             class="text-[10px] text-primary-content hover:underline mt-2 inline-block font-bold"
           >
-            Change Directory
+            Session List
           </.dm_link>
         </div>
 
