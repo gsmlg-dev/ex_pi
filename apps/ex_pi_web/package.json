@@ -11,14 +11,13 @@
     "@duskmoon-dev/elements": "1.5.0",
     "@duskmoon-dev/art-elements": "1.5.0",
     "topbar": "3.0.1",
+    "@duskmoon-dev/el-chat": "1.5.0",
     "@duskmoon-dev/el-button": "1.5.0",
     "@duskmoon-dev/el-card": "1.5.0",
     "@duskmoon-dev/el-dialog": "1.5.0",
     "@duskmoon-dev/el-input": "1.5.0",
     "@duskmoon-dev/el-menu": "1.5.0",
     "@duskmoon-dev/el-badge": "1.5.0",
-    "@duskmoon-dev/el-chip": "1.5.0",
-    "marked": "18.0.4",
-    "dompurify": "3.4.5"
+    "@duskmoon-dev/el-chip": "1.5.0"
   }
 }

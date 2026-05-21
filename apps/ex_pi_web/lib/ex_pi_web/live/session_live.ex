@@ -66,6 +66,8 @@ defmodule PiWeb.SessionLive do
         active_provider = system_config["providers"][provider_id] || %{}
         available_models = active_provider["models"] || [model_id]
 
+        {stream_messages, tool_results, tool_call_to_msg} = split_messages(initial_messages)
+
         socket =
           socket
           |> assign(:active_tab, :repository)
@@ -74,13 +76,15 @@ defmodule PiWeb.SessionLive do
           |> assign(:encoded_repository, encoded_repository)
           |> assign(:sessions_dir, sessions_dir)
           |> assign(:agent, agent)
-          |> assign(:input, "")
           |> assign(:turn_in_flight, false)
+          |> assign(:streaming_message_id, nil)
+          |> assign(:tool_results, tool_results)
+          |> assign(:tool_call_to_msg, tool_call_to_msg)
           |> assign(:sessions, sessions)
           |> assign(:active_provider_id, provider_id)
           |> assign(:current_model, model_id)
           |> assign(:available_models, available_models)
-          |> stream(:messages, initial_messages)
+          |> stream(:messages, stream_messages)
 
         {:ok, socket}
     end
@@ -141,145 +145,45 @@ defmodule PiWeb.SessionLive do
 
       <!-- Main Chat -->
       <div class="flex-1 flex flex-col min-w-0 bg-surface-container-lowest">
-        <div id="messages" phx-update="stream" phx-hook="ScrollBottom" class="flex-1 overflow-y-auto p-6 space-y-6">
+        <div id="messages" phx-update="stream" phx-hook="ScrollBottom" class="flex-1 overflow-y-auto p-6 space-y-2">
           <div :for={{id, message} <- @streams.messages} id={id} class="max-w-4xl mx-auto w-full">
-            <.dm_card
-              variant={if message.role == :user, do: "bordered", else: "glass"}
-              shadow="sm"
-              class="overflow-hidden"
-            >
-              <div class="flex items-start gap-4 p-4 text-on-surface">
-                <div class={[
-                  "mt-1 p-2 rounded-xl",
-                  message.role == :user && "bg-primary text-primary-content",
-                  message.role == :tool_result && "bg-tertiary text-tertiary-content",
-                  message.role not in [:user, :tool_result] && "bg-secondary text-secondary-content"
-                ]}>
-                  <.dm_mdi
-                    name={
-                      case message.role do
-                        :user -> "account"
-                        :tool_result -> "console"
-                        _ -> "robot"
-                      end
-                    }
-                    class="w-5 h-5"
-                  />
-                </div>
-                <div class="min-w-0 flex-1">
-                  <div class="flex justify-between items-center mb-1">
-                    <span class="text-xs font-bold uppercase tracking-wider opacity-60 font-mono">
-                      {role_label(message)}
-                    </span>
-                    <div class="flex items-center gap-2">
-                      <span :if={message.is_error} class="text-[10px] font-bold text-error font-mono">
-                        ERROR
-                      </span>
-                      <span class="text-[10px] opacity-40 font-mono">
-                        {format_timestamp(message.timestamp)}
-                      </span>
-                      <.dm_btn
-                        :if={message.id != nil}
-                        id={"fork-at-#{message.id}"}
-                        phx-click="fork_at"
-                        phx-value-msg-id={message.id}
-                        phx-hook="WebComponentHook"
-                        variant="ghost"
-                        size="xs"
-                        title="Fork session from here"
-                      >
-                        <.dm_mdi name="source-branch" class="w-3 h-3 opacity-50 hover:opacity-100" />
-                      </.dm_btn>
-                    </div>
-                  </div>
-                  <div
-                    :if={message.role in [:assistant, :compaction_summary]}
-                    id={"md-#{message.id}"}
-                    phx-hook="MarkdownContent"
-                    data-content={render_content(message.content)}
-                    class="content markdown font-sans text-base leading-relaxed"
-                  >
-                  </div>
-                  <div
-                    :if={message.role not in [:assistant, :compaction_summary]}
-                    class={[
-                      "content whitespace-pre-wrap font-sans text-base leading-relaxed",
-                      message.is_error && "text-error"
-                    ]}
-                  >
-                    {render_content(message.content)}
-                  </div>
-                  <div
-                    :if={message.role == :assistant and not is_nil(message.usage)}
-                    class="mt-2 flex gap-3 text-[10px] font-mono opacity-40"
-                  >
-                    <span>in: {message.usage.input}</span>
-                    <span>out: {message.usage.output}</span>
-                    <span :if={not is_nil(get_in(message.usage, [:cost, :total]))}>
-                      ${format_cost(get_in(message.usage, [:cost, :total]))}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </.dm_card>
+            <.message_bubble
+              message={message}
+              tool_results={@tool_results}
+              streaming_message_id={@streaming_message_id}
+              encoded_repository={@encoded_repository}
+            />
           </div>
         </div>
 
         <div class="p-6 border-t border-outline-variant bg-surface">
           <div class="max-w-4xl mx-auto">
-            <!-- Agent status banner: only visible while a turn is in flight -->
-            <div
-              :if={@turn_in_flight}
-              id="agent-status"
-              role="status"
-              aria-live="polite"
-              class="mb-3 flex items-center gap-3 px-4 py-2 rounded-xl bg-primary-container/40 border border-primary/30 text-on-surface"
-            >
-              <.dm_loading_spinner size="sm" variant="primary" />
-              <span class="text-sm font-medium">Agent is working…</span>
-              <span class="text-[10px] opacity-60 ml-auto font-mono">streaming</span>
+            <div :if={@turn_in_flight} class="mb-3 flex items-center justify-between gap-3">
+              <div class="flex items-center gap-3 text-sm text-on-surface-variant">
+                <.dm_chat_typing />
+                <span>Agent is working…</span>
+              </div>
+              <.dm_btn
+                id="cancel-turn-btn"
+                type="button"
+                phx-click="cancel_turn"
+                phx-hook="WebComponentHook"
+                variant="ghost"
+                size="sm"
+              >
+                <:prefix><.dm_mdi name="stop" class="text-error w-4 h-4" /></:prefix>
+                Stop
+              </.dm_btn>
             </div>
 
-            <form phx-submit="send_prompt">
-              <div class="relative">
-                <textarea
-                  id="prompt-input"
-                  name="prompt"
-                  rows="3"
-                  phx-hook="ChatInput"
-                  placeholder="Ask π anything… (Markdown supported, Shift+Enter for newline)"
-                  class="w-full pr-12 px-4 py-3 rounded-2xl border border-outline-variant bg-surface-container focus:border-primary focus:outline-none resize-none font-mono text-sm leading-relaxed"
-                  autocomplete="off"
-                  spellcheck="false"
-                >{@input}</textarea>
-                <div class="absolute right-2 bottom-2 flex gap-1">
-                  <.dm_btn
-                    :if={@turn_in_flight}
-                    id="cancel-turn-btn"
-                    type="button"
-                    phx-click="cancel_turn"
-                    phx-hook="WebComponentHook"
-                    variant="ghost"
-                    shape="circle"
-                    size="sm"
-                  >
-                    <.dm_mdi name="stop" class="text-error w-5 h-5" />
-                  </.dm_btn>
-                  <.dm_btn
-                    id="send-prompt-btn"
-                    type="submit"
-                    variant="ghost"
-                    shape="circle"
-                    size="sm"
-                    phx-hook="WebComponentHook"
-                  >
-                    <.dm_mdi name="send" class="text-primary w-5 h-5" />
-                  </.dm_btn>
-                </div>
-              </div>
-            </form>
+            <.dm_chat_input
+              id="prompt-input"
+              placeholder="Ask π anything… (Ctrl+Enter to send)"
+              disabled={@turn_in_flight}
+              clear_on_send={true}
+              duskmoon-send-send="send_prompt"
+            />
 
-            <!-- Footer row: model selector + hint -->
             <div class="mt-3 flex items-center justify-between gap-4 text-[11px] text-on-surface-variant">
               <form phx-change="select_model" class="flex items-center gap-2">
                 <label for="model-select" class="opacity-60 font-medium">Model</label>
@@ -299,38 +203,174 @@ defmodule PiWeb.SessionLive do
                 </span>
               </form>
               <p class="opacity-60 text-right">
-                π is an AI agent. Review its work carefully. Enter sends, Shift+Enter for newline.
+                π is an AI agent. Review its work carefully.
               </p>
             </div>
           </div>
         </div>
       </div>
-
     </div>
     """
   end
 
-  defp render_content(content) when is_binary(content), do: content
+  defp message_bubble(%{message: %{role: :user}} = assigns) do
+    ~H"""
+    <.dm_chat
+      id={@message.id}
+      align="end"
+      variant="filled"
+      color="secondary"
+      avatar="You"
+      time={format_timestamp(@message.timestamp)}
+      content={user_content(@message.content)}
+    />
+    """
+  end
 
-  defp render_content(content) when is_list(content) do
+  defp message_bubble(%{message: %{role: :assistant}} = assigns) do
+    ~H"""
+    <.dm_chat
+      id={@message.id}
+      align="start"
+      avatar="π"
+      time={format_timestamp(@message.timestamp)}
+      streaming={@message.id == @streaming_message_id}
+    >
+      <.content_block
+        :for={block <- List.wrap(@message.content)}
+        block={block}
+        tool_results={@tool_results}
+      />
+      <:footer :if={not is_nil(@message.usage)}>
+        <span class="text-[10px] opacity-40 font-mono">
+          in: {@message.usage.input} · out: {@message.usage.output}
+        </span>
+      </:footer>
+      <:actions_slot>
+        <.dm_btn
+          id={"fork-at-#{@message.id}"}
+          phx-click="fork_at"
+          phx-value-msg-id={@message.id}
+          phx-hook="WebComponentHook"
+          variant="ghost"
+          size="xs"
+          title="Fork session from here"
+        >
+          <.dm_mdi name="source-branch" class="w-3 h-3" />
+        </.dm_btn>
+      </:actions_slot>
+    </.dm_chat>
+    """
+  end
+
+  defp message_bubble(%{message: %{role: :compaction_summary}} = assigns) do
+    ~H"""
+    <.dm_chat
+      id={@message.id}
+      align="start"
+      avatar="∑"
+      time={format_timestamp(@message.timestamp)}
+      content={@message.summary || "Context compacted."}
+    />
+    """
+  end
+
+  defp message_bubble(assigns), do: ~H""
+
+  defp content_block(%{block: %{type: :thinking}} = assigns) do
+    ~H"""
+    <.dm_chat_reasoning summary="Reasoning">
+      {@block.thinking}
+    </.dm_chat_reasoning>
+    """
+  end
+
+  defp content_block(%{block: %{type: :text}} = assigns) do
+    ~H"""
+    <.dm_markdown content={@block.text} />
+    """
+  end
+
+  defp content_block(%{block: %{type: :tool_call}} = assigns) do
+    ~H"""
+    <.dm_chat_tool name={@block.name} status={tool_call_status(@tool_results, @block.id)}>
+      <:call>
+        <pre class="text-xs overflow-x-auto p-2 whitespace-pre-wrap">{format_tool_args(@block.arguments)}</pre>
+      </:call>
+      <:result :if={Map.has_key?(@tool_results, @block.id)}>
+        <pre class="text-xs overflow-x-auto p-2 whitespace-pre-wrap">{elem(@tool_results[@block.id], 0)}</pre>
+      </:result>
+    </.dm_chat_tool>
+    """
+  end
+
+  defp content_block(assigns), do: ~H""
+
+  defp user_content(content) when is_binary(content), do: content
+
+  defp user_content(content) when is_list(content) do
     content
     |> Enum.map(fn
       %{type: :text, text: text} -> text
-      %{type: :thinking} -> "[Thinking...]"
-      %{type: :tool_call, name: name} -> "→ #{name}(...)"
       _ -> nil
     end)
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
   end
 
-  defp render_content(_), do: ""
+  defp user_content(_), do: ""
 
-  defp role_label(%{role: :tool_result, tool_name: name}) when is_binary(name),
-    do: "tool: #{name}"
+  defp tool_call_status(tool_results, tool_call_id) do
+    case Map.get(tool_results, tool_call_id) do
+      nil -> "running"
+      {_, true} -> "error"
+      _ -> "success"
+    end
+  end
 
-  defp role_label(%{role: :compaction_summary}), do: "compacted summary"
-  defp role_label(%{role: role}), do: role
+  defp format_tool_args(args) when is_map(args) do
+    Jason.encode!(args, pretty: true)
+  rescue
+    _ -> inspect(args)
+  end
+
+  defp format_tool_args(args), do: inspect(args)
+
+  defp render_tool_result_content(content) when is_list(content) do
+    content
+    |> Enum.map(fn
+      %{type: :text, text: text} -> text
+      _ -> nil
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp render_tool_result_content(content) when is_binary(content), do: content
+  defp render_tool_result_content(_), do: ""
+
+  defp split_messages(messages) do
+    Enum.reduce(messages, {[], %{}, %{}}, fn msg, {stream_msgs, tool_results, tc_map} ->
+      case msg.role do
+        :tool_result ->
+          content_str = render_tool_result_content(msg.content)
+
+          {stream_msgs, Map.put(tool_results, msg.tool_call_id, {content_str, msg.is_error}),
+           tc_map}
+
+        :assistant ->
+          new_tc_map =
+            List.wrap(msg.content)
+            |> Enum.filter(&(is_map(&1) && Map.get(&1, :type) == :tool_call))
+            |> Enum.reduce(tc_map, &Map.put(&2, &1.id, msg))
+
+          {stream_msgs ++ [msg], tool_results, new_tc_map}
+
+        _ ->
+          {stream_msgs ++ [msg], tool_results, tc_map}
+      end
+    end)
+  end
 
   defp format_timestamp(ts) when is_integer(ts) do
     ts |> DateTime.from_unix!(:millisecond) |> Calendar.strftime("%H:%M:%S")
@@ -338,17 +378,6 @@ defmodule PiWeb.SessionLive do
 
   defp format_timestamp(_), do: ""
 
-  defp format_cost(cost) when is_float(cost) and cost < 0.001,
-    do: :erlang.float_to_binary(cost, decimals: 6)
-
-  defp format_cost(cost) when is_float(cost),
-    do: :erlang.float_to_binary(cost, decimals: 4)
-
-  defp format_cost(_), do: "?"
-
-  # Defensive: even if the current model isn't in the configured list
-  # (e.g. user is running with a value set outside the UI), include it
-  # in the dropdown so the visible selection matches reality.
   defp ensure_in_list(list, nil), do: list || []
   defp ensure_in_list(nil, current), do: [current]
 
@@ -373,14 +402,14 @@ defmodule PiWeb.SessionLive do
   end
 
   @impl true
-  def handle_event("send_prompt", %{"prompt" => prompt}, socket) do
+  def handle_event("send_prompt", %{"value" => prompt}, socket) do
     case String.trim(prompt) do
       "" ->
         {:noreply, socket}
 
       trimmed ->
         PiAgent.prompt(socket.assigns.agent, trimmed)
-        {:noreply, assign(socket, input: "")}
+        {:noreply, socket}
     end
   end
 
@@ -406,12 +435,12 @@ defmodule PiWeb.SessionLive do
 
   @impl true
   def handle_info({:agent_end, _}, socket) do
-    {:noreply, assign(socket, :turn_in_flight, false)}
+    {:noreply, assign(socket, turn_in_flight: false, streaming_message_id: nil)}
   end
 
   @impl true
   def handle_info({:turn_cancelled}, socket) do
-    {:noreply, assign(socket, :turn_in_flight, false)}
+    {:noreply, assign(socket, turn_in_flight: false, streaming_message_id: nil)}
   end
 
   @impl true
@@ -421,7 +450,17 @@ defmodule PiWeb.SessionLive do
     {:noreply,
      socket
      |> put_flash(:error, "Turn failed: #{msg}")
-     |> assign(:turn_in_flight, false)}
+     |> assign(turn_in_flight: false, streaming_message_id: nil)}
+  end
+
+  @impl true
+  def handle_info({:message_start, %{role: :assistant} = message}, socket) do
+    socket =
+      socket
+      |> stream_insert(:messages, message)
+      |> assign(:streaming_message_id, message.id)
+
+    {:noreply, socket}
   end
 
   @impl true
@@ -432,6 +471,38 @@ defmodule PiWeb.SessionLive do
   @impl true
   def handle_info({:message_update, message, _event}, socket) do
     {:noreply, stream_insert(socket, :messages, message)}
+  end
+
+  @impl true
+  def handle_info({:message_end, %{role: :tool_result} = message}, socket) do
+    content_str = render_tool_result_content(message.content)
+    parent_msg = Map.get(socket.assigns.tool_call_to_msg, message.tool_call_id)
+
+    socket =
+      update(
+        socket,
+        :tool_results,
+        &Map.put(&1, message.tool_call_id, {content_str, message.is_error})
+      )
+
+    socket = if parent_msg, do: stream_insert(socket, :messages, parent_msg), else: socket
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_info({:message_end, %{role: :assistant, content: content} = message}, socket)
+      when is_list(content) do
+    new_tc_map =
+      content
+      |> Enum.filter(&(is_map(&1) && Map.get(&1, :type) == :tool_call))
+      |> Enum.reduce(socket.assigns.tool_call_to_msg, &Map.put(&2, &1.id, message))
+
+    socket =
+      socket
+      |> stream_insert(:messages, message)
+      |> assign(:tool_call_to_msg, new_tc_map)
+
+    {:noreply, socket}
   end
 
   @impl true
@@ -460,7 +531,7 @@ defmodule PiWeb.SessionLive do
         :error,
         "The agent process crashed. Your session history is preserved — refresh to reconnect."
       )
-      |> assign(:turn_in_flight, false)
+      |> assign(turn_in_flight: false, streaming_message_id: nil)
 
     {:noreply, socket}
   end
