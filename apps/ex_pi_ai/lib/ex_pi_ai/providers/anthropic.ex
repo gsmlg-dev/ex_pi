@@ -56,30 +56,59 @@ defmodule PiAi.Providers.Anthropic do
 
     Elixir.Stream.resource(
       fn ->
-        Req.post!(base_url <> "/v1/messages",
-          json: body,
-          headers: headers,
-          receive_timeout: 60_000,
-          into: fn {:data, data}, {req, resp} ->
-            send(self(), {:chunk, data})
-            {:cont, {req, resp}}
-          end
-        )
-
-        {_initial_assistant_message(model), ""}
-      end,
-      fn {message, buffer} ->
-        receive do
-          {:chunk, chunk} ->
-            {events, new_buffer} = Stream.decode(buffer, chunk)
-            {processed_events, new_message} = process_events(events, message)
-            {processed_events, {new_message, new_buffer}}
-        after
-          60_000 -> {:halt, {message, buffer}}
+        try do
+          Req.post!(base_url <> "/v1/messages",
+            json: body,
+            headers: headers,
+            receive_timeout: options[:receive_timeout] || 120_000,
+            into: fn {:data, data}, {req, resp} ->
+              send(self(), {:chunk, data})
+              {:cont, {req, resp}}
+            end
+          )
+        rescue
+          e in Finch.TransportError ->
+            reraise transport_error_message(e), __STACKTRACE__
         end
+
+        {_initial_assistant_message(model), "", :streaming}
+      end,
+      fn
+        {message, _buffer, :done} ->
+          {:halt, message}
+
+        {message, buffer, :streaming} ->
+          receive do
+            {:chunk, chunk} ->
+              {events, new_buffer} = Stream.decode(buffer, chunk)
+              {processed_events, new_message} = process_events(events, message)
+
+              status =
+                if Enum.any?(processed_events, &match?({:done, _, _}, &1)),
+                  do: :done,
+                  else: :streaming
+
+              {processed_events, {new_message, new_buffer, status}}
+          after
+            120_000 -> {:halt, message}
+          end
       end,
       fn _ -> :ok end
     )
+  end
+
+  # A network timeout or connection failure to the AI provider is an
+  # expected failure — convert it into a RuntimeError with a readable
+  # message so the agent surfaces it as a clean {:turn_error, ...} flash
+  # instead of crashing the turn task.
+  defp transport_error_message(%Finch.TransportError{reason: :timeout}) do
+    "The AI provider did not respond in time (request timed out). " <>
+      "Check your network connection and API key, then try again."
+  end
+
+  defp transport_error_message(%Finch.TransportError{reason: reason}) do
+    "Network error contacting the AI provider: #{inspect(reason)}. " <>
+      "Check your connection and try again."
   end
 
   defp _initial_assistant_message(model) do

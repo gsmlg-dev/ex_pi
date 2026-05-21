@@ -42,6 +42,14 @@
 - **Where does permission-blocking actually live, process-wise?**
   Permission blocking lives within the tool execution task (spawned by the `Dispatcher`). When a tool requires permission, it calls a request callback that broadcasts a PubSub event and then blocks on a `receive` block. The LiveView receives the event, renders a modal, and when the user responds, sends a message back to the waiting tool process. This ensures that only the specific tool execution is blocked, while the Agent GenServer and the LiveView remain responsive to other events.
 
+### Phase L — Streaming reliability
+
+- **L.1: Why did a `Finch.TransportError` crash the turn task instead of becoming a clean error?**
+  `run_stream/2` only rescues `RuntimeError` and `Jason.DecodeError` (see A.2). A network timeout contacting the AI provider raises `Finch.TransportError` from `Req.post!`, which is neither — so it escaped, crashed the turn task, and dumped a SASL crash report to the console before the `{:DOWN}` path re-emitted it with a raw reason. A timeout to an external API is an *expected* failure, not a bug, so it should be handled explicitly. The fix wraps the `Req.post!` call inside each provider's `Stream.resource` start function in a `try/rescue` that converts `Finch.TransportError` into a `RuntimeError` carrying a human-readable message (`"The AI provider did not respond in time…"`). `run_stream/2`'s existing `RuntimeError` rescue then catches it and emits a clean `{:turn_error, msg}` flash. The rescue stays narrow — genuine bugs (`FunctionClauseError`, etc.) still crash loudly and are caught by the `{:DOWN}` fallback, which is correct for a study port under active development.
+
+- **L.2: Why did every successful turn hang for 60 seconds before completing?**
+  `Req.post!` with an `into:` callback drains the entire HTTP response into the process mailbox as `{:chunk, data}` messages *synchronously*, before the `Stream.resource` reduce loop starts. The loop's only termination was `after 60_000 -> {:halt, …}`. The provider-level `:done` event (Anthropic `message_stop`, OpenAI `[DONE]`) was produced and forwarded to the agent, but never used to stop the stream — so after the last real chunk, the loop sat in `receive` until the 60-second timeout fired on *every* turn. The fix threads a `:streaming | :done` status through the `Stream.resource` accumulator (now a 3-tuple `{message, buffer, status}`); when `process_events` yields a `{:done, _, _}` event the next iteration matches `{_, _, :done} -> {:halt, message}` and the stream ends immediately. The `after` clause was kept (raised to 120s) purely as a safety net for a provider that stops sending mid-stream without a terminator. The `receive_timeout` is now `options[:receive_timeout] || 120_000` so slow models do not trip the transport timeout.
+
 ### Phase A — Daily-use blockers
 
 - **A.1: Task vs DynamicSupervisor — which did you pick, and what would have to grow before switching?**
@@ -160,6 +168,7 @@
 - [x] Phase H — URL fetch tool (H.1)
 - [x] Phase J — Context file walking (J.1–J.3)
 - [x] Phase K — Project settings page: rename, relocate, remove (K.1–K.3)
+- [x] Phase L — Streaming reliability: transport-error handling, stream termination (L.1–L.2)
 
 ## Phase A Summary
 

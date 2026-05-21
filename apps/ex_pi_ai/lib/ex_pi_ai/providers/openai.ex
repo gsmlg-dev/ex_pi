@@ -9,8 +9,12 @@ defmodule PiAi.Providers.OpenAI do
     context = params.context
     options = params.options
 
-    api_key = options[:api_key] || System.get_env("OPENAI_API_KEY") || System.get_env("OPENROUTER_API_KEY")
-    base_url = options[:base_url] || System.get_env("OPENAI_BASE_URL") || "https://api.openai.com/v1"
+    api_key =
+      options[:api_key] || System.get_env("OPENAI_API_KEY") ||
+        System.get_env("OPENROUTER_API_KEY")
+
+    base_url =
+      options[:base_url] || System.get_env("OPENAI_BASE_URL") || "https://api.openai.com/v1"
 
     body = %{
       model: model.id,
@@ -21,7 +25,8 @@ defmodule PiAi.Providers.OpenAI do
     }
 
     # Add tools if present
-    body = if context[:tools], do: Map.put(body, :tools, transform_tools(context.tools)), else: body
+    body =
+      if context[:tools], do: Map.put(body, :tools, transform_tools(context.tools)), else: body
 
     headers = [
       {"Authorization", "Bearer #{api_key}"},
@@ -30,29 +35,59 @@ defmodule PiAi.Providers.OpenAI do
 
     Elixir.Stream.resource(
       fn ->
-        Req.post!(base_url <> "/chat/completions",
-          json: body,
-          headers: headers,
-          receive_timeout: 60_000,
-          into: fn {:data, data}, {req, resp} ->
-            send(self(), {:chunk, data})
-            {:cont, {req, resp}}
-          end
-        )
-        {_initial_assistant_message(model), ""}
-      end,
-      fn {message, buffer} ->
-        receive do
-          {:chunk, chunk} ->
-            {events, new_buffer} = Stream.decode(buffer, chunk)
-            {processed_events, new_message} = process_events(events, message)
-            {processed_events, {new_message, new_buffer}}
-        after
-          60_000 -> {:halt, {message, buffer}}
+        try do
+          Req.post!(base_url <> "/chat/completions",
+            json: body,
+            headers: headers,
+            receive_timeout: options[:receive_timeout] || 120_000,
+            into: fn {:data, data}, {req, resp} ->
+              send(self(), {:chunk, data})
+              {:cont, {req, resp}}
+            end
+          )
+        rescue
+          e in Finch.TransportError ->
+            reraise transport_error_message(e), __STACKTRACE__
         end
+
+        {_initial_assistant_message(model), "", :streaming}
+      end,
+      fn
+        {message, _buffer, :done} ->
+          {:halt, message}
+
+        {message, buffer, :streaming} ->
+          receive do
+            {:chunk, chunk} ->
+              {events, new_buffer} = Stream.decode(buffer, chunk)
+              {processed_events, new_message} = process_events(events, message)
+
+              status =
+                if Enum.any?(processed_events, &match?({:done, _, _}, &1)),
+                  do: :done,
+                  else: :streaming
+
+              {processed_events, {new_message, new_buffer, status}}
+          after
+            120_000 -> {:halt, message}
+          end
       end,
       fn _ -> :ok end
     )
+  end
+
+  # A network timeout or connection failure to the AI provider is an
+  # expected failure — convert it into a RuntimeError with a readable
+  # message so the agent surfaces it as a clean {:turn_error, ...} flash
+  # instead of crashing the turn task.
+  defp transport_error_message(%Finch.TransportError{reason: :timeout}) do
+    "The AI provider did not respond in time (request timed out). " <>
+      "Check your network connection and API key, then try again."
+  end
+
+  defp transport_error_message(%Finch.TransportError{reason: reason}) do
+    "Network error contacting the AI provider: #{inspect(reason)}. " <>
+      "Check your connection and try again."
   end
 
   defp _initial_assistant_message(model) do
@@ -104,9 +139,18 @@ defmodule PiAi.Providers.OpenAI do
 
   defp transform_content(content) do
     Enum.map(content, fn
-      %{type: :text, text: text} -> %{type: "text", text: text}
-      %{type: :thinking, thinking: thinking} -> %{type: "thinking", thinking: thinking}
-      %{type: :tool_call} = tc -> %{type: "tool", id: tc.id, function: %{name: tc.name, arguments: Jason.encode!(tc.arguments)}}
+      %{type: :text, text: text} ->
+        %{type: "text", text: text}
+
+      %{type: :thinking, thinking: thinking} ->
+        %{type: "thinking", thinking: thinking}
+
+      %{type: :tool_call} = tc ->
+        %{
+          type: "tool",
+          id: tc.id,
+          function: %{name: tc.name, arguments: Jason.encode!(tc.arguments)}
+        }
     end)
   end
 
@@ -135,13 +179,16 @@ defmodule PiAi.Providers.OpenAI do
           delta = choice["delta"]
           finish_reason = choice["finish_reason"]
 
-          acc = if finish_reason, do: %{acc | stop_reason: transform_stop_reason(finish_reason)}, else: acc
+          acc =
+            if finish_reason,
+              do: %{acc | stop_reason: transform_stop_reason(finish_reason)},
+              else: acc
 
           cond do
             Map.has_key?(delta, "content") ->
               text = delta["content"]
               # Check if we need to start a text block
-              {acc, event_to_emit} = 
+              {acc, event_to_emit} =
                 if Enum.at(acc.content, index) == nil do
                   new_content = List.insert_at(acc.content, index, %{type: :text, text: ""})
                   new_acc = %{acc | content: new_content}
@@ -149,13 +196,15 @@ defmodule PiAi.Providers.OpenAI do
                 else
                   {acc, nil}
                 end
-              
-              new_content = update_content(acc.content, index, fn block ->
-                %{block | text: (block[:text] || "") <> text}
-              end)
+
+              new_content =
+                update_content(acc.content, index, fn block ->
+                  %{block | text: (block[:text] || "") <> text}
+                end)
+
               new_acc = %{acc | content: new_content}
               delta_event = {:text_delta, index, text, new_acc}
-              
+
               events = if event_to_emit, do: [event_to_emit, delta_event], else: [delta_event]
               {events, new_acc}
 
@@ -171,7 +220,8 @@ defmodule PiAi.Providers.OpenAI do
           new_acc = %{acc | usage: transform_usage(usage)}
           {[], new_acc}
 
-        _ -> {[], acc}
+        _ ->
+          {[], acc}
       end
     end)
     |> then(fn {events, acc} -> {List.flatten(events), acc} end)
