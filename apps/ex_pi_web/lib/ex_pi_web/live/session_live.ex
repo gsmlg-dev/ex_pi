@@ -221,6 +221,7 @@ defmodule PiWeb.SessionLive do
 
             <.dm_chat_input
               id="prompt-input"
+              phx-update="ignore"
               placeholder="Ask π anything… (⌘/Ctrl+Enter to send)"
               disabled={@turn_in_flight}
               clear_on_send={true}

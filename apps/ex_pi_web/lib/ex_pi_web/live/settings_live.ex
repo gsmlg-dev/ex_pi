@@ -240,6 +240,7 @@ defmodule PiWeb.SettingsLive do
         <form phx-submit="save_system_prompt" class="space-y-4">
           <.dm_markdown_input
             id="system-prompt-editor"
+            phx-update="ignore"
             phx-hook="MarkdownInputHook"
             name="system_prompt"
             value={@system_prompt}
