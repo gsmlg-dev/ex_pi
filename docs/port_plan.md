@@ -76,7 +76,7 @@ If `mix compile` fails on the scaffolded stubs, fix that first and record what w
 **Tasks, in order:**
 1. Define wire types (`Message`, `ToolCall`, `StreamEvent`) in `lib/ex_pi_ai/message.ex`. Match pi's variants; do not invent new ones.
 2. Define the `Provider` behaviour. `stream/1` returns an `Enumerable` of `StreamEvent`.
-3. Implement `ExPiAi.Stream` as a pure SSE reducer: takes `(state, binary)`, returns `{events, state}`. No process, no IO. This is the central architectural piece.
+3. Implement `PiAi.Stream` as a pure SSE reducer: takes `(state, binary)`, returns `{events, state}`. No process, no IO. This is the central architectural piece.
 4. Implement one provider end-to-end. **Start with Anthropic** (simplest tool-call wire format). Use `Req` for HTTP.
 5. Capture a live trace to `apps/ex_pi_ai/test/fixtures/sse/anthropic_hello.txt`. Write a test that replays the fixture through `Stream` and asserts the event sequence.
 6. Add OpenAI as the second provider. **`StreamEvent` must not change.** If it must, stage 1 is not yet complete — investigate why.
@@ -84,7 +84,7 @@ If `mix compile` fails on the scaffolded stubs, fix that first and record what w
 **Exit criteria:**
 - `mix test` passes including fixture replay.
 - A live Anthropic call streams tokens to stdout incrementally.
-- The OpenAI provider was added without modifying `ExPiAi.Stream` or `StreamEvent`.
+- The OpenAI provider was added without modifying `PiAi.Stream` or `StreamEvent`.
 
 **Forbidden this stage:**
 - Touching anything outside `apps/ex_pi_ai/`.
@@ -104,8 +104,8 @@ If `mix compile` fails on the scaffolded stubs, fix that first and record what w
 **Read first:** `packages/agent/src/` in full. Focus on the `Agent` class, `AgentMessage` vs `Message`, `transformContext`, `convertToLlm`, the event emitter, and the steering/follow-up queue interaction with turn boundaries.
 
 **Tasks:**
-1. Define `ExPiAgent.Message` — the rich domain type. Identify carefully what it carries that wire `Message` does not.
-2. Define `ExPiAgent.Event` — agent-level event types. Distinguish from `ExPiAi.StreamEvent`.
+1. Define `PiAgent.Message` — the rich domain type. Identify carefully what it carries that wire `Message` does not.
+2. Define `PiAgent.Event` — agent-level event types. Distinguish from `PiAi.StreamEvent`.
 3. Implement `convert_to_llm/1` as a pure function. Test independently with edge cases (tool-call ID continuity, custom variants, redacted messages).
 4. Implement `transform_context` as a single composition slot in the per-turn pipeline.
 5. Build the loop as **one `GenServer` per session**. Exposes `subscribe/1`, `prompt/2`. Resist Supervisor-per-session — that is a stage-2-refactor question, not a stage-2 design question.

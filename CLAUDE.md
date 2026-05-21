@@ -42,36 +42,36 @@ This is an **umbrella project** with five apps under `apps/`:
 
 | App | Module prefix | Role |
 |-----|--------------|------|
-| `ex_pi_ai` | `ExPiAi` | LLM provider abstraction — streaming SSE parsing |
-| `ex_pi_agent` | `ExPiAgent` | GenServer per session — manages the turn loop |
-| `ex_pi_session` | `ExPiSession` | JSONL append-only persistence + config management |
-| `ex_pi_coding` | `ExPiCoding` | Tool system (read/edit/bash) + permission interceptor |
-| `ex_pi_web` | `ExPiWeb` | Phoenix LiveView UI + session lifecycle management |
+| `ex_pi_ai` | `PiAi` | LLM provider abstraction — streaming SSE parsing |
+| `ex_pi_agent` | `PiAgent` | GenServer per session — manages the turn loop |
+| `ex_pi_session` | `PiSession` | JSONL append-only persistence + config management |
+| `ex_pi_coding` | `PiCoding` | Tool system (read/edit/bash) + permission interceptor |
+| `ex_pi_web` | `PiWeb` | Phoenix LiveView UI + session lifecycle management |
 
 ### Key Data Flow
 
-1. User submits prompt → `SessionLive` → `ExPiAgent.prompt/2` (cast)
-2. `ExPiAgent` runs `run_turn_loop/1`: transforms messages → calls `Provider.stream/1` → reduces SSE events
-3. On tool calls: `ExPiCoding.Dispatcher.dispatch_batch/3` executes tools in parallel via `Task.Supervisor`
+1. User submits prompt → `SessionLive` → `PiAgent.prompt/2` (cast)
+2. `PiAgent` runs `run_turn_loop/1`: transforms messages → calls `Provider.stream/1` → reduces SSE events
+3. On tool calls: `PiCoding.Dispatcher.dispatch_batch/3` executes tools in parallel via `Task.Supervisor`
 4. Every `{:message_end, msg}` event is persisted to a `.jsonl` file AND broadcast over PubSub to the LiveView
 5. LiveView receives events via `handle_info` and updates the message stream
 
 ### Provider Behaviour
 
-`ExPiAi.Provider` defines a single callback: `stream(params) :: Enumerable.t()`. Providers must return a lazy stream of tagged tuples:
+`PiAi.Provider` defines a single callback: `stream(params) :: Enumerable.t()`. Providers must return a lazy stream of tagged tuples:
 - `{:start, ai_msg}`, `{:text_delta, idx, text, ai_msg}`, `{:thinking_delta, ...}`, `{:toolcall_start/delta/end, ...}`, `{:done, stop_reason, ai_msg}`
 
 Current implementations: `Anthropic`, `OpenAI`, `ReqLLM` (generic OpenAI-compat). A `MockProvider` exists inline in `session_live.ex` for testing.
 
 ### Session Persistence
 
-Sessions are stored as JSONL files at `~/.pi/sessions/<base64-encoded-workdir>/<session-id>.jsonl`. Each line is a JSON object with a `"type"` field (`"session"` header, `"message"`, `"compaction"`). `ExPiSession.Log.replay/1` reconstructs `ExPiAgent.Message` structs from these entries, handling compaction summaries.
+Sessions are stored as JSONL files at `~/.pi/sessions/<base64-encoded-workdir>/<session-id>.jsonl`. Each line is a JSON object with a `"type"` field (`"session"` header, `"message"`, `"compaction"`). `PiSession.Log.replay/1` reconstructs `PiAgent.Message` structs from these entries, handling compaction summaries.
 
 Session **forking** copies the JSONL prefix up to a given message index into a new file — it never mutates the original.
 
 ### Permission System
 
-`ExPiCoding.PermissionInterceptor.check/2` gates all tool execution. It delegates to an `ExPiCoding.PermissionPolicy` GenServer (default: `:allow`). When a tool requires human approval, the interceptor calls `permission_request_fn` which blocks via `receive` — the LiveView answers through PubSub. The 60-second timeout in `SessionLive` matches the interceptor's expected response window.
+`PiCoding.PermissionInterceptor.check/2` gates all tool execution. It delegates to an `PiCoding.PermissionPolicy` GenServer (default: `:allow`). When a tool requires human approval, the interceptor calls `permission_request_fn` which blocks via `receive` — the LiveView answers through PubSub. The 60-second timeout in `SessionLive` matches the interceptor's expected response window.
 
 ### Configuration
 
@@ -81,7 +81,7 @@ Agent config is stored in `~/.pi/agent/` (pi-compatible format):
 - `models.json` — provider/model definitions
 - `AGENTS.md` — system prompt (plain text)
 
-`ExPiSession.ConfigManager` reads/writes these files and translates the pi format into the internal representation used by the UI.
+`PiSession.ConfigManager` reads/writes these files and translates the pi format into the internal representation used by the UI.
 
 ### Routes
 
