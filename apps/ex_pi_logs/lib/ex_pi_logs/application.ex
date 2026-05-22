@@ -3,6 +3,8 @@ defmodule PiLogs.Application do
 
   @impl true
   def start(_type, _args) do
+    PiLogs.Entry.init_counter()
+
     children = [
       {Registry, keys: :unique, name: PiLogs.Registry},
       {DynamicSupervisor, name: PiLogs.BufferSupervisor, strategy: :one_for_one}
