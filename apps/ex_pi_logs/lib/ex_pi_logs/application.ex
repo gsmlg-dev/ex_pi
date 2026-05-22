@@ -10,6 +10,8 @@ defmodule PiLogs.Application do
       {DynamicSupervisor, name: PiLogs.BufferSupervisor, strategy: :one_for_one}
     ]
 
-    Supervisor.start_link(children, strategy: :one_for_one, name: PiLogs.Supervisor)
+    result = Supervisor.start_link(children, strategy: :one_for_one, name: PiLogs.Supervisor)
+    PiLogs.Handler.attach_all()
+    result
   end
 end
