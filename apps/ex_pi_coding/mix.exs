@@ -25,7 +25,8 @@ defmodule PiCoding.MixProject do
   defp deps do
     [
       {:ex_pi_ai, in_umbrella: true},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:telemetry, "~> 1.0"}
     ]
   end
 end
