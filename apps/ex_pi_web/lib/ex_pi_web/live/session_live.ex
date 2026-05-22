@@ -39,6 +39,8 @@ defmodule PiWeb.SessionLive do
       {:ok, {provider_mod, model_id, provider_id, api_key, base_url}} ->
         if connected?(socket) do
           Phoenix.PubSub.subscribe(PiWeb.PubSub, "session:#{session_id}")
+          Phoenix.PubSub.subscribe(PiWeb.PubSub, "ex_pi:logs:#{session_id}")
+          PiLogs.start_session(session_id)
         end
 
         {:ok, initial_messages} = PiSession.Log.replay(storage_path)
@@ -98,6 +100,11 @@ defmodule PiWeb.SessionLive do
           |> assign(:active_provider_id, provider_id)
           |> assign(:current_model, model_id)
           |> assign(:available_models, available_models)
+          |> assign(:logs_available, true)
+          |> assign(:show_logs, false)
+          |> assign(:log_entries, [])
+          |> assign(:log_filter, nil)
+          |> assign(:log_search, "")
           |> stream(:messages, stream_messages)
 
         {:ok, socket}
@@ -547,6 +554,32 @@ defmodule PiWeb.SessionLive do
   end
 
   @impl true
+  def handle_event("toggle_logs", _params, socket) do
+    {:noreply, assign(socket, :show_logs, !socket.assigns.show_logs)}
+  end
+
+  @impl true
+  def handle_event("set_log_filter", %{"category" => cat}, socket) do
+    category = if cat == "", do: nil, else: String.to_existing_atom(cat)
+
+    entries =
+      PiLogs.search(socket.assigns.session_id,
+        category: category,
+        text: socket.assigns.log_search
+      )
+
+    {:noreply, socket |> assign(:log_filter, category) |> assign(:log_entries, entries)}
+  end
+
+  @impl true
+  def handle_event("set_log_search", %{"query" => q}, socket) do
+    entries =
+      PiLogs.search(socket.assigns.session_id, category: socket.assigns.log_filter, text: q)
+
+    {:noreply, socket |> assign(:log_search, q) |> assign(:log_entries, entries)}
+  end
+
+  @impl true
   def handle_event("select_model", %{"model" => model_id}, socket) do
     provider_id = socket.assigns.active_provider_id
 
@@ -670,6 +703,17 @@ defmodule PiWeb.SessionLive do
   end
 
   @impl true
+  def handle_info({:log_entry, entry}, socket) do
+    entries = [entry | socket.assigns.log_entries] |> Enum.take(500)
+    {:noreply, assign(socket, :log_entries, entries)}
+  end
+
+  @impl true
+  def handle_info({:toggle_logs}, socket) do
+    {:noreply, assign(socket, :show_logs, !socket.assigns.show_logs)}
+  end
+
+  @impl true
   def handle_info(_event, socket) do
     {:noreply, socket}
   end
@@ -738,6 +782,13 @@ defmodule PiWeb.SessionLive do
 
       _ ->
         %{}
+    end
+  end
+
+  @impl true
+  def terminate(_reason, socket) do
+    if socket.assigns[:session_id] do
+      PiLogs.stop_session(socket.assigns.session_id)
     end
   end
 end
