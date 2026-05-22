@@ -40,7 +40,6 @@ defmodule PiWeb.LogDrawerLive do
           value={@search}
           phx-keyup="set_log_search"
           phx-key="Enter"
-          phx-value-query={@search}
           class="ml-auto text-xs px-2 py-1 rounded bg-surface-variant border border-outline/20 focus:outline-none focus:border-primary w-36"
         />
       </div>
@@ -95,8 +94,11 @@ defmodule PiWeb.LogDrawerLive do
     |> String.slice(0, 12)
   end
 
-  defp summarize(%{category: :llm, event: :request_start, metadata: m}),
-    do: "→ #{m[:model]} (#{map_size(m[:request_body] || %{})} body fields)"
+  defp summarize(%{category: :llm, event: :request_start, metadata: m}) do
+    body = m[:request_body]
+    field_count = if is_map(body), do: map_size(body), else: 0
+    "→ #{m[:model]} (#{field_count} body fields)"
+  end
 
   defp summarize(%{category: :llm, event: :request_stop, metadata: m}),
     do: "← #{m[:model]} | #{(m[:usage] || %{}) |> Map.get(:output, 0)} output tokens"

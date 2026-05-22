@@ -577,7 +577,7 @@ defmodule PiWeb.SessionLive do
   end
 
   @impl true
-  def handle_event("set_log_search", %{"query" => q}, socket) do
+  def handle_event("set_log_search", %{"value" => q}, socket) do
     entries =
       PiLogs.search(socket.assigns.session_id, category: socket.assigns.log_filter, text: q)
 
