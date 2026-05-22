@@ -560,7 +560,12 @@ defmodule PiWeb.SessionLive do
 
   @impl true
   def handle_event("set_log_filter", %{"category" => cat}, socket) do
-    category = if cat == "", do: nil, else: String.to_existing_atom(cat)
+    category =
+      case cat do
+        "" -> nil
+        c when c in ~w(llm tool permission) -> String.to_existing_atom(c)
+        _ -> socket.assigns.log_filter
+      end
 
     entries =
       PiLogs.search(socket.assigns.session_id,
@@ -704,7 +709,15 @@ defmodule PiWeb.SessionLive do
 
   @impl true
   def handle_info({:log_entry, entry}, socket) do
-    entries = [entry | socket.assigns.log_entries] |> Enum.take(500)
+    %{log_filter: filter, log_search: search, log_entries: entries} = socket.assigns
+
+    entries =
+      if entry_matches?(entry, filter, search) do
+        [entry | entries] |> Enum.take(500)
+      else
+        entries
+      end
+
     {:noreply, assign(socket, :log_entries, entries)}
   end
 
@@ -785,10 +798,22 @@ defmodule PiWeb.SessionLive do
     end
   end
 
+  defp entry_matches?(_entry, nil, ""), do: true
+
+  defp entry_matches?(entry, category, "") when not is_nil(category),
+    do: entry.category == category
+
+  defp entry_matches?(entry, nil, text), do: String.contains?(inspect(entry.metadata), text)
+
+  defp entry_matches?(entry, category, text),
+    do: entry.category == category and String.contains?(inspect(entry.metadata), text)
+
   @impl true
   def terminate(_reason, socket) do
     if socket.assigns[:session_id] do
       PiLogs.stop_session(socket.assigns.session_id)
     end
+
+    :ok
   end
 end
