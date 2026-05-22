@@ -257,16 +257,15 @@ defmodule PiWeb.SessionLive do
         </div>
       </div>
 
+      <.live_component
+        :if={@show_logs}
+        module={PiWeb.LogDrawerLive}
+        id="log-drawer"
+        entries={@log_entries}
+        filter={@log_filter}
+        search={@log_search}
+      />
     </div>
-
-    <.live_component
-      :if={@show_logs}
-      module={PiWeb.LogDrawerLive}
-      id="log-drawer"
-      entries={@log_entries}
-      filter={@log_filter}
-      search={@log_search}
-    />
     """
   end
 
