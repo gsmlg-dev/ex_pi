@@ -688,7 +688,8 @@ const css$6 = `/**
   }
 }
 `;
-new CSSStyleSheet().replaceSync(css$6);
+const sheet$6 = typeof CSSStyleSheet !== "undefined" ? new CSSStyleSheet() : null;
+if (sheet$6) sheet$6.replaceSync(css$6);
 var styles$11 = css$7`
   ${css$6.replace(/@layer\s+components\s*\{/, "").replace(/\}[\s]*$/, "")}
 
@@ -1762,6 +1763,25 @@ const css$5 = `/**
   }
 
   /* Icon Button */
+  .btn-icon {
+    padding: 0.75rem;
+    width: 2.5rem;
+    height: 2.5rem;
+    border-radius: var(--radius-full);
+  }
+
+  .btn-icon-sm {
+    padding: 0.5rem;
+    width: 2rem;
+    height: 2rem;
+  }
+
+  .btn-icon-lg {
+    padding: 1rem;
+    width: 3rem;
+    height: 3rem;
+  }
+
   .btn-circle {
     --btn-p: 0.625rem;
     --btn-py: 0.625rem;
@@ -1787,7 +1807,8 @@ const css$5 = `/**
   }
 }
 `;
-new CSSStyleSheet().replaceSync(css$5);
+const sheet$5 = typeof CSSStyleSheet !== "undefined" ? new CSSStyleSheet() : null;
+if (sheet$5) sheet$5.replaceSync(css$5);
 //#endregion
 //#region node_modules/@duskmoon-dev/el-button/dist/esm/register.js
 var VARIANT_CLASSES$2 = {
@@ -2233,7 +2254,8 @@ const css$4 = `/**
   }
 }
 `;
-new CSSStyleSheet().replaceSync(css$4);
+const sheet$4 = typeof CSSStyleSheet !== "undefined" ? new CSSStyleSheet() : null;
+if (sheet$4) sheet$4.replaceSync(css$4);
 //#endregion
 //#region node_modules/@duskmoon-dev/el-card/dist/esm/register.js
 var VARIANT_CLASSES$1 = {
@@ -2794,7 +2816,8 @@ const css$3 = `/**
   }
 }
 `;
-new CSSStyleSheet().replaceSync(css$3);
+const sheet$3 = typeof CSSStyleSheet !== "undefined" ? new CSSStyleSheet() : null;
+if (sheet$3) sheet$3.replaceSync(css$3);
 //#endregion
 //#region node_modules/@duskmoon-dev/el-chip/dist/esm/register.js
 var VARIANT_CLASSES = {
@@ -3326,7 +3349,8 @@ const css$2 = `/**
   }
 }
 `;
-new CSSStyleSheet().replaceSync(css$2);
+const sheet$2 = typeof CSSStyleSheet !== "undefined" ? new CSSStyleSheet() : null;
+if (sheet$2) sheet$2.replaceSync(css$2);
 //#endregion
 //#region node_modules/@duskmoon-dev/el-dialog/dist/esm/register.js
 var SIZE_CLASSES = {
@@ -3641,6 +3665,65 @@ const css$1 = `/**
     margin: 0;
     padding: 0.5rem;
     gap: 0.25rem;
+  }
+
+  /* Native floating menu. Keep closed popovers hidden despite the base flex layout. */
+  .menu[popover] {
+    display: none;
+    position: absolute;
+    inset: auto;
+    margin: 0.5rem;
+    min-width: 12rem;
+    max-width: calc(100vw - 1rem);
+    max-height: calc(100dvh - 1rem);
+    overflow: auto;
+    color: var(--color-on-surface);
+    background-color: var(--color-surface-container);
+    border: 1px solid var(--color-outline-variant);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    position-area: bottom;
+    position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+    opacity: 0;
+    transform: scale(0.95);
+    transition:
+      opacity 150ms ease-out,
+      transform 150ms ease-out,
+      overlay 150ms ease-out allow-discrete,
+      display 150ms ease-out allow-discrete;
+  }
+
+  .menu[popover]:popover-open {
+    display: flex;
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  @starting-style {
+    .menu[popover]:popover-open {
+      opacity: 0;
+      transform: scale(0.95);
+    }
+  }
+
+  .menu[popover]::backdrop {
+    background-color: transparent;
+  }
+
+  .menu-top[popover] {
+    position-area: top;
+  }
+
+  .menu-bottom[popover] {
+    position-area: bottom;
+  }
+
+  .menu-left[popover] {
+    position-area: left;
+  }
+
+  .menu-right[popover] {
+    position-area: right;
   }
 
   .menu li {
@@ -4321,6 +4404,10 @@ const css$1 = `/**
 
   /* Reduce Motion */
   @media (prefers-reduced-motion: reduce) {
+    .menu li > a,
+    .menu li > button,
+    .menu-item,
+    .menu[popover],
     .pagination-item,
     .pagination-prev,
     .pagination-next {
@@ -4329,7 +4416,8 @@ const css$1 = `/**
   }
 }
 `;
-new CSSStyleSheet().replaceSync(css$1);
+const sheet$1 = typeof CSSStyleSheet !== "undefined" ? new CSSStyleSheet() : null;
+if (sheet$1) sheet$1.replaceSync(css$1);
 var menuStyles = css$7`
   :host {
     display: inline-block;
@@ -5232,7 +5320,8 @@ const css = `/**
   }
 }
 `;
-new CSSStyleSheet().replaceSync(css);
+const sheet = typeof CSSStyleSheet !== "undefined" ? new CSSStyleSheet() : null;
+if (sheet) sheet.replaceSync(css);
 var styles = css$7`
   :host {
     display: inline-block;
@@ -5254,11 +5343,13 @@ var styles = css$7`
   .popover-content {
     position: fixed;
     min-width: 8rem;
+    visibility: hidden;
     pointer-events: none;
     font-family: inherit;
   }
 
   .popover-content.show {
+    visibility: visible;
     pointer-events: auto;
   }
 

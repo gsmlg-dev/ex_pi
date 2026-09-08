@@ -43,8 +43,6 @@ el-dm-dialog [slot="footer"] {
   white-space: nowrap;
 }
 
-.settings-skills-description-cell el-dm-popover,
-.settings-skills-description-cell [slot="trigger"],
 .settings-skills-description-cell p {
   max-width: 100%;
 }

@@ -992,8 +992,11 @@ defmodule Sigma.Web.SettingsLive do
                   placement="top-start"
                   class="max-w-md"
                 >
-                  <:trigger>
-                    <p class="settings-skills-description-trigger text-sm text-on-surface-variant">
+                  <:trigger :let={trigger_attrs}>
+                    <p
+                      {trigger_attrs}
+                      class="settings-skills-description-trigger text-sm text-on-surface-variant cursor-help"
+                    >
                       {skill.description}
                     </p>
                   </:trigger>

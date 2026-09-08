@@ -672,9 +672,11 @@ defmodule Sigma.Web.SettingsLiveTest do
 
   defp assert_skill_description_popover(html, id) do
     tree = Floki.parse_document!(html)
-    [popover] = Floki.find(tree, "#skill-description-#{id}")
-    assert Floki.find(popover, "p.settings-skills-description-trigger") != []
+    popover_id = "skill-description-#{id}"
+    [popover] = Floki.find(tree, "##{popover_id}")
+    assert Floki.find(tree, "p.settings-skills-description-trigger[interestfor='#{popover_id}']") != []
     assert Floki.text(popover) =~ "Global skill description"
+    assert Floki.attribute(popover, "popover") == ["auto"]
     assert html =~ "settings-skills-description-cell"
 
     css = File.read!(@app_css)
