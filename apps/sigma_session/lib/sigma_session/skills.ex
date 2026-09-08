@@ -152,12 +152,7 @@ defmodule Sigma.Session.Skills do
     |> String.replace("\r", "\n")
     |> String.split("\n", trim: false)
     |> frontmatter_lines()
-    |> Enum.reduce(%{}, fn line, metadata ->
-      case parse_metadata_line(line) do
-        nil -> metadata
-        {key, value} -> Map.put(metadata, key, value)
-      end
-    end)
+    |> parse_entries()
   end
 
   defp frontmatter_lines(["---" | rest]) do
@@ -169,19 +164,114 @@ defmodule Sigma.Session.Skills do
 
   defp frontmatter_lines(_lines), do: []
 
-  defp parse_metadata_line(line) do
-    trimmed = String.trim(line)
+  defp parse_entries(lines) do
+    lines
+    |> chunk_entries()
+    |> Enum.reduce(%{}, fn {key, value}, metadata ->
+      Map.put(metadata, key, value)
+    end)
+  end
 
-    cond do
-      trimmed == "" or String.starts_with?(trimmed, "#") ->
-        nil
+  defp chunk_entries(lines) do
+    lines
+    |> Enum.reduce([], fn line, acc ->
+      trimmed = String.trim(line)
 
-      String.contains?(trimmed, ":") ->
-        [key, value] = String.split(trimmed, ":", parts: 2)
-        {String.trim(key), parse_scalar(value)}
+      cond do
+        trimmed == "" or String.starts_with?(trimmed, "#") ->
+          case acc do
+            [{key, type, val_lines} | rest] when type in [:literal, :literal_strip] ->
+              [{key, type, val_lines ++ [line]} | rest]
 
-      true ->
-        nil
+            _ ->
+              acc
+          end
+
+        not String.starts_with?(line, [" ", "\t"]) and String.contains?(line, ":") ->
+          [key, value] = String.split(line, ":", parts: 2)
+          trimmed_key = String.trim(key)
+          trimmed_val = String.trim(value)
+
+          entry_type =
+            case trimmed_val do
+              ">-" -> :folded_strip
+              ">" -> :folded
+              "|-" -> :literal_strip
+              "|" -> :literal
+              "" -> :indented_block
+              _ -> :scalar
+            end
+
+          initial_lines = if entry_type == :scalar, do: [trimmed_val], else: []
+          [{trimmed_key, entry_type, initial_lines} | acc]
+
+        String.starts_with?(line, [" ", "\t"]) ->
+          case acc do
+            [{key, type, val_lines} | rest] ->
+              [{key, type, val_lines ++ [line]} | rest]
+
+            [] ->
+              acc
+          end
+
+        true ->
+          acc
+      end
+    end)
+    |> Enum.reverse()
+    |> Enum.map(&finalize_entry/1)
+  end
+
+  defp finalize_entry({key, type, lines}) when type in [:folded, :folded_strip, :indented_block] do
+    joined =
+      lines
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join(" ")
+      |> String.trim()
+
+    {key, joined}
+  end
+
+  defp finalize_entry({key, type, lines}) when type in [:literal, :literal_strip] do
+    indent = common_indent(lines)
+    stripped = Enum.map_join(lines, "\n", fn l -> String.slice(l, indent..-1//1) || "" end)
+    val = if type == :literal_strip, do: String.trim_trailing(stripped), else: stripped
+    {key, val}
+  end
+
+  defp finalize_entry({key, :scalar, [first_val | rest]}) do
+    all_text =
+      if rest == [] do
+        first_val
+      else
+        first_val <> " " <> (rest |> Enum.map(&String.trim/1) |> Enum.join(" "))
+      end
+      |> String.trim()
+
+    {key, parse_scalar(all_text)}
+  end
+
+  defp finalize_entry({key, :scalar, []}) do
+    {key, ""}
+  end
+
+  defp common_indent(lines) do
+    non_empty = Enum.reject(lines, &(String.trim(&1) == ""))
+
+    case non_empty do
+      [] ->
+        0
+
+      _ ->
+        non_empty
+        |> Enum.map(fn line ->
+          case Regex.run(~r/^[ \t]+/, line) do
+            [spaces] -> String.length(spaces)
+            _ -> 0
+          end
+        end)
+        |> Enum.min()
     end
   end
 

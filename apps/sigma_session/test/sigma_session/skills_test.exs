@@ -48,4 +48,49 @@ defmodule Sigma.Session.SkillsTest do
     assert diagnostic.path == Path.join(skill_dir, "SKILL.md")
     assert diagnostic.message == "description is required"
   end
+
+  @tag :tmp_dir
+  test "parses folded block scalars (> and >-) in skill description", %{tmp_dir: tmp_dir} do
+    skills_root = Path.join([tmp_dir, ".agents", "skills"])
+    agent_note_dir = Path.join(skills_root, "agent-note")
+    caveman_dir = Path.join(skills_root, "caveman")
+    File.mkdir_p!(agent_note_dir)
+    File.mkdir_p!(caveman_dir)
+
+    File.write!(
+      Path.join(agent_note_dir, "SKILL.md"),
+      """
+      ---
+      name: agent-note
+      description: >-
+        Configure Agent Note in a project's AGENTS.md when setup is requested, and recall
+        or maintain project-scoped knowledge through Agent Note MCP.
+      compatibility: Note workflows require Agent Note MCP.
+      ---
+      # Agent Note
+      """
+    )
+
+    File.write!(
+      Path.join(caveman_dir, "SKILL.md"),
+      """
+      ---
+      name: caveman
+      description: >
+        Ultra-compressed communication mode. Cuts token usage ~75% by dropping
+        filler, articles, and pleasantries while keeping full technical accuracy.
+      ---
+      # Caveman
+      """
+    )
+
+    assert %{skills: skills, diagnostics: []} = Skills.list_dir(skills_root, :global)
+    skills_by_name = Map.new(skills, &{&1.name, &1})
+
+    assert skills_by_name["agent-note"].description ==
+             "Configure Agent Note in a project's AGENTS.md when setup is requested, and recall or maintain project-scoped knowledge through Agent Note MCP."
+
+    assert skills_by_name["caveman"].description ==
+             "Ultra-compressed communication mode. Cuts token usage ~75% by dropping filler, articles, and pleasantries while keeping full technical accuracy."
+  end
 end
