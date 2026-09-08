@@ -98,6 +98,133 @@ const AutocompleteHook = {
   }
 }
 
+// Polyfill for HTML Interest Invokers (`interestfor` attribute).
+// Enables hover/focus triggering for native popovers across browsers that don't
+// yet support the experimental Interest Invokers API natively.
+function setupInterestInvokers() {
+  let activeTarget = null
+  let hideTimer = null
+
+  const getTarget = (id) => {
+    if (!id) return null
+    return document.getElementById(id)
+  }
+
+  const supportsAnchor =
+    typeof CSS !== 'undefined' &&
+    CSS.supports &&
+    (CSS.supports('anchor-name', '--foo') || CSS.supports('position-anchor', '--foo'))
+
+  const showInterest = (invoker, targetId) => {
+    if (hideTimer) {
+      clearTimeout(hideTimer)
+      hideTimer = null
+    }
+
+    const target = getTarget(targetId)
+    if (!target || typeof target.showPopover !== 'function') return
+
+    if (activeTarget && activeTarget !== target) {
+      try {
+        activeTarget.hidePopover()
+      } catch (_) {}
+    }
+
+    try {
+      if (!target.matches(':popover-open')) {
+        target.showPopover()
+      }
+
+      if (!supportsAnchor && invoker) {
+        const rect = invoker.getBoundingClientRect()
+        target.style.position = 'fixed'
+        target.style.top = `${rect.bottom + 8}px`
+        target.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - (target.offsetWidth || 300) - 8))}px`
+      }
+
+      activeTarget = target
+    } catch (_) {}
+  }
+
+  const hideInterest = (targetId) => {
+    if (hideTimer) clearTimeout(hideTimer)
+
+    hideTimer = setTimeout(() => {
+      const target = getTarget(targetId)
+      if (target && typeof target.hidePopover === 'function') {
+        try {
+          if (target.matches(':popover-open')) {
+            target.hidePopover()
+          }
+        } catch (_) {}
+      }
+      if (activeTarget === target) {
+        activeTarget = null
+      }
+    }, 120)
+  }
+
+  document.addEventListener('mouseover', (e) => {
+    const invoker = e.target.closest?.('[interestfor]')
+    if (invoker) {
+      showInterest(invoker, invoker.getAttribute('interestfor'))
+      return
+    }
+
+    const popover = e.target.closest?.('[popover]')
+    if (popover && popover.matches(':popover-open')) {
+      if (hideTimer) {
+        clearTimeout(hideTimer)
+        hideTimer = null
+      }
+    }
+  })
+
+  document.addEventListener('mouseout', (e) => {
+    const invoker = e.target.closest?.('[interestfor]')
+    if (invoker) {
+      const targetId = invoker.getAttribute('interestfor')
+      const target = getTarget(targetId)
+      const related = e.relatedTarget
+
+      if (related && (invoker.contains(related) || (target && target.contains(related)))) {
+        return
+      }
+
+      hideInterest(targetId)
+      return
+    }
+
+    const popover = e.target.closest?.('[popover]')
+    if (popover && popover.matches(':popover-open')) {
+      const related = e.relatedTarget
+      if (related && popover.contains(related)) {
+        return
+      }
+
+      hideInterest(popover.id)
+    }
+  })
+
+  document.addEventListener('focusin', (e) => {
+    const invoker = e.target.closest?.('[interestfor]')
+    if (invoker) {
+      showInterest(invoker, invoker.getAttribute('interestfor'))
+    }
+  })
+
+  document.addEventListener('focusout', (e) => {
+    const invoker = e.target.closest?.('[interestfor]')
+    if (invoker) {
+      hideInterest(invoker.getAttribute('interestfor'))
+    }
+  })
+}
+
+if (typeof document !== 'undefined') {
+  setupInterestInvokers()
+}
+
 // Auto-show dialogs when they mount
 const ModalHook = {
   mounted() {

@@ -54,6 +54,24 @@ el-dm-dialog [slot="footer"] {
   white-space: nowrap;
 }
 
+.settings-skills-name-trigger {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.popover[popover] {
+  overflow: visible;
+}
+
+.popover[popover] .popover-body {
+  max-height: 24rem;
+  overflow-y: auto;
+}
+
 .sigma-session-shell {
   min-width: 0;
 }

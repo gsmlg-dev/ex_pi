@@ -961,7 +961,26 @@ defmodule Sigma.Web.SettingsLive do
                   <div class="p-2 bg-primary/10 rounded-lg text-primary shrink-0">
                     <.dm_mdi name="auto-fix" class="w-5 h-5" />
                   </div>
-                  <span class="font-bold truncate">{skill.name}</span>
+                  <.dm_popover
+                    id={"skill-name-#{skill_row_id(skill)}"}
+                    trigger_mode="hover"
+                    placement="top-start"
+                    arrow={false}
+                    class="max-w-xs"
+                  >
+                    <:trigger :let={trigger_attrs}>
+                      <span
+                        {trigger_attrs}
+                        title={skill.name}
+                        class="settings-skills-name-trigger font-bold cursor-help"
+                      >
+                        {skill.name}
+                      </span>
+                    </:trigger>
+                    <p class="font-mono text-xs font-semibold text-on-surface break-all">
+                      {skill.name}
+                    </p>
+                  </.dm_popover>
                 </div>
               </td>
               <td data-label="Enabled" role="cell" class="min-w-28">
@@ -990,11 +1009,13 @@ defmodule Sigma.Web.SettingsLive do
                   id={"skill-description-#{skill_row_id(skill)}"}
                   trigger_mode="hover"
                   placement="top-start"
+                  arrow={false}
                   class="max-w-md"
                 >
                   <:trigger :let={trigger_attrs}>
                     <p
                       {trigger_attrs}
+                      title={skill.description}
                       class="settings-skills-description-trigger text-sm text-on-surface-variant cursor-help"
                     >
                       {skill.description}

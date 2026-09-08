@@ -355,6 +355,7 @@ defmodule Sigma.Web.SettingsLiveTest do
       assert_skill_selected(html, "global-skill", false)
       assert_select_all_checked(html, false)
       assert_skill_description_popover(html, "global-skill")
+      assert_skill_name_popover(html, "global-skill")
 
       view
       |> element("#skill-enabled-global-skill")
@@ -685,6 +686,18 @@ defmodule Sigma.Web.SettingsLiveTest do
     assert css =~ "max-width: 25%;"
     assert css =~ "overflow: hidden;"
     assert css =~ "text-overflow: ellipsis;"
+  end
+
+  defp assert_skill_name_popover(html, id) do
+    tree = Floki.parse_document!(html)
+    popover_id = "skill-name-#{id}"
+    [popover] = Floki.find(tree, "##{popover_id}")
+    assert Floki.find(tree, ".settings-skills-name-trigger[interestfor='#{popover_id}']") != []
+    assert Floki.text(popover) =~ id
+    assert Floki.attribute(popover, "popover") == ["auto"]
+
+    css = File.read!(@app_css)
+    assert css =~ ".settings-skills-name-trigger"
   end
 
   defp class_values({_tag, attrs, _children}) do
