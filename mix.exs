@@ -67,8 +67,14 @@ defmodule Sigma.MixProject do
     release_build_path = Path.join(Mix.Project.build_path(), "sigma_rel")
 
     executable = Path.join([release_build_path, "rel", "sigma", "bin", "sigma"])
+    launcher = Path.expand("scripts/sigma-rel-run", __DIR__)
 
-    case Mix.shell().cmd({executable, ["start"]}, use_stdio: true) do
+    env = [
+      {"RELEASE_DISTRIBUTION", "none"},
+      {"SIGMA_REL_RUN_PARENT_PID", to_string(:os.getpid())}
+    ]
+
+    case Mix.shell().cmd({launcher, [executable, "start"]}, env: env, use_stdio: true) do
       0 -> :ok
       status -> Mix.raise("Sigma release exited with status #{status}")
     end

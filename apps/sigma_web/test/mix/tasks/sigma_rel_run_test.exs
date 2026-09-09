@@ -7,6 +7,7 @@ defmodule Mix.Tasks.SigmaRelRunTest do
   @dev_config_path Path.join(@repo_root, "config/dev.exs")
   @prod_config_path Path.join(@repo_root, "config/prod.exs")
   @runtime_config_path Path.join(@repo_root, "config/runtime.exs")
+  @launcher_path Path.join(@repo_root, "scripts/sigma-rel-run")
 
   test "builds and starts an overwrite release in the current Mix environment" do
     aliases = Sigma.MixProject.project()[:aliases]
@@ -22,8 +23,20 @@ defmodule Mix.Tasks.SigmaRelRunTest do
     assert source =~ ~S|{"SIGMA_RELEASE", "true"}|
     assert source =~ ~S|["release", "sigma", "--overwrite", "--force"]|
     assert source =~ ~S|Path.join([release_build_path, "rel", "sigma", "bin", "sigma"])|
-    assert source =~ ~S|Mix.shell().cmd({executable, ["start"]}, use_stdio: true)|
+    assert source =~ ~S|launcher = Path.expand("scripts/sigma-rel-run", __DIR__)|
+    assert source =~ ~S|{"RELEASE_DISTRIBUTION", "none"}|
+    assert source =~ ~S|{"SIGMA_REL_RUN_PARENT_PID", to_string(:os.getpid())}|
+    assert source =~ ~S|Mix.shell().cmd({launcher, [executable, "start"]}, env: env, use_stdio: true)|
     assert source =~ ~S|Mix.raise("Sigma release exited with status #{status}")|
+  end
+
+  test "release launcher has valid shell syntax" do
+    assert {_, 0} = System.cmd("sh", ["-n", @launcher_path], stderr_to_stdout: true)
+  end
+
+  test "release launcher reports usage when no release command is given" do
+    assert {output, 64} = System.cmd(@launcher_path, [], stderr_to_stdout: true)
+    assert output =~ "Usage:"
   end
 
   test "devenv owns the release as its foreground process" do

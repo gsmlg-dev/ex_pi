@@ -1,0 +1,46 @@
+#!/bin/sh
+
+set -eu
+
+if [ "$#" -eq 0 ]; then
+  echo "Usage: $0 RELEASE_EXECUTABLE [COMMAND [ARGS...]]" >&2
+  exit 64
+fi
+
+parent_pid="${SIGMA_REL_RUN_PARENT_PID:-$PPID}"
+
+"$@" &
+child_pid=$!
+
+stop_child() {
+  kill -TERM "$child_pid" 2>/dev/null || true
+
+  i=0
+  while kill -0 "$child_pid" 2>/dev/null && [ "$i" -lt 50 ]; do
+    i=$((i + 1))
+    sleep 0.1
+  done
+
+  kill -KILL "$child_pid" 2>/dev/null || true
+}
+
+watch_parent() {
+  while kill -0 "$parent_pid" 2>/dev/null; do
+    sleep 0.2
+  done
+
+  stop_child
+}
+
+watch_parent &
+watcher_pid=$!
+
+set +e
+wait "$child_pid"
+status=$?
+set -e
+
+kill "$watcher_pid" 2>/dev/null || true
+wait "$watcher_pid" 2>/dev/null || true
+
+exit "$status"
