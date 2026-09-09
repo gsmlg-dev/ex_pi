@@ -131,6 +131,11 @@ defmodule Sigma.Coding.MCP do
 
   @doc """
   Executes a discovered MCP tool against its live client.
+
+  On `:send_failure` (transport cannot deliver the request), returns
+  `{:transport_failure, message, tool_name, server_id, error_data}` so
+  the agent loop can detect a stuck transport without parsing the message
+  string. Other errors keep the existing `{:error, message}` shape.
   """
   def call_tool(%Tool{client: client} = tool, _tool_call_id, params, opts) do
     timeout = Keyword.get(opts, :timeout, @call_timeout)
@@ -147,6 +152,9 @@ defmodule Sigma.Coding.MCP do
              details: result,
              is_error: Response.error?(response)
            }}
+
+        {:error, %Error{reason: :send_failure} = error} ->
+          {:transport_failure, format_error(error), tool.name, tool.server_id, error.data}
 
         {:error, error} ->
           {:error, format_error(error)}
@@ -435,7 +443,16 @@ defmodule Sigma.Coding.MCP do
     %{type: :text, text: inspect(block)}
   end
 
-  defp format_error(%Error{message: message}) when is_binary(message), do: message
+  defp format_error(%Error{message: message, data: data}) when is_binary(message) do
+    case data do
+      %{original_reason: reason} when not is_nil(reason) ->
+        "#{message} (#{inspect(reason)})"
+
+      _ ->
+        message
+    end
+  end
+
   defp format_error(%Error{reason: reason}) when not is_nil(reason), do: inspect(reason)
   defp format_error(error), do: inspect(error)
 

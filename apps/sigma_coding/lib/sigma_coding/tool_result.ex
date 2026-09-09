@@ -17,7 +17,8 @@ defmodule Sigma.Coding.ToolResult do
   def normalize({:error, %ToolError{} = error}), do: {:error, error}
 
   def normalize({:ok, result}) when is_map(result) do
-    with {:ok, content} <- normalize_content(Map.get(result, :content, Map.get(result, "content"))) do
+    with {:ok, content} <-
+           normalize_content(Map.get(result, :content, Map.get(result, "content"))) do
       {:ok,
        %__MODULE__{
          content: content,
@@ -31,6 +32,20 @@ defmodule Sigma.Coding.ToolResult do
   end
 
   def normalize({:error, reason}), do: {:error, ToolError.new(:execution, reason)}
+
+  # Marker returned by `Sigma.Coding.MCP.call_tool/4` when the underlying
+  # transport cannot deliver the request. We surface the human-readable
+  # `message` to the model and attach the rest as metadata so the agent
+  # loop can identify the failure structurally.
+  def normalize({:transport_failure, message, tool_name, server_id, data}) do
+    {:error,
+     %ToolError{
+       kind: :transport_failure,
+       message: message,
+       details: %{tool_name: tool_name, server_id: server_id, data: data}
+     }}
+  end
+
   def normalize(nil), do: {:error, ToolError.new(:malformed_result, :empty_result)}
   def normalize(other), do: {:error, ToolError.new(:malformed_result, {:unknown_result, other})}
 

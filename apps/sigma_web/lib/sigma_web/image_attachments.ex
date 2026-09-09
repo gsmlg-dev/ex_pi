@@ -214,7 +214,7 @@ defmodule Sigma.Web.ImageAttachments do
       table_bytes = 3 * Bitwise.bsl(1, Bitwise.band(packed, 0x07) + 1)
 
       case rest do
-        <<_table::binary-size(table_bytes), tail::binary>> -> {:ok, tail}
+        <<_table::binary-size(^table_bytes), tail::binary>> -> {:ok, tail}
         _truncated -> {:error, :invalid_data}
       end
     end

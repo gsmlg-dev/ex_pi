@@ -888,8 +888,6 @@ defmodule Sigma.Agent do
     end
   end
 
-  defp maybe_start_follow_up(state, _outcome), do: state
-
   defp clear_cancel_timer(%{turn_state: %{cancel_timer: timer}} = state)
        when is_reference(timer) do
     Process.cancel_timer(timer)
@@ -1250,17 +1248,17 @@ defmodule Sigma.Agent do
       Enum.map_reduce(results, state, fn {tool_call, result}, acc_state ->
         msg_id = "msg_tool_res_#{System.unique_integer([:positive])}"
 
-        {content, is_error} =
+        {content, is_error, error_kind} =
           case result do
             {:ok, %{content: content} = result} ->
-              {content, Map.get(result, :is_error, false)}
+              {content, Map.get(result, :is_error, false), nil}
 
-            {:error, %ToolError{message: message}} ->
+            {:error, %ToolError{message: message, kind: kind}} ->
               maybe_emit_approval_required(acc_state, result, tool_call)
-              {[%{type: :text, text: "Error: #{message}"}], true}
+              {[%{type: :text, text: "Error: #{message}"}], true, kind}
 
             _malformed ->
-              {[%{type: :text, text: "Error: malformed tool runtime result"}], true}
+              {[%{type: :text, text: "Error: malformed tool runtime result"}], true, :malformed}
           end
 
         tool_res_msg =
@@ -1276,11 +1274,16 @@ defmodule Sigma.Agent do
         emit(acc_state, {:message_start, tool_res_msg})
         emit(acc_state, {:message_end, tool_res_msg})
 
-        next_state = %{acc_state | messages: acc_state.messages ++ [tool_res_msg]}
-        acknowledge_canonical(next_state)
-        {tool_res_msg, next_state}
+        acc_state =
+          acc_state
+          |> Map.update!(:messages, &(&1 ++ [tool_res_msg]))
+          |> track_tool_failure(tool_call, error_kind)
+
+        acknowledge_canonical(acc_state)
+        {tool_res_msg, acc_state}
       end)
 
+    state = maybe_inject_loop_breaker_nudge(state, results)
     {state, tool_result_messages}
   end
 
@@ -1301,6 +1304,93 @@ defmodule Sigma.Agent do
   end
 
   defp maybe_emit_approval_required(_state, _result, _tool_call), do: :ok
+
+  # MCP transport-failure loop breaker
+  # -------------------------------------------------------------------------
+  # When an MCP tool call fails (e.g. transport down, server unreachable),
+  # a naive model will keep calling it. Track consecutive failures per
+  # `(tool_name, args)` key in `state.tool_state` (ETS) and, once the
+  # threshold is hit, inject a synthetic user-role message that tells the
+  # model to switch tools or stop and report.
+
+  @tool_loop_breaker_threshold 3
+  @tool_loop_breaker_window_ms 5 * 60 * 1_000
+
+  defp track_tool_failure(state, tool_call, error_kind) do
+    if error_kind in [:transport_failure, :execution, :malformed] do
+      key = tool_failure_key(tool_call)
+      :ets.update_counter(state.tool_state, key, {2, 1}, {key, 0})
+    else
+      :ets.delete(state.tool_state, tool_failure_key(tool_call))
+    end
+
+    state
+  end
+
+  defp tool_failure_key(%{name: name, arguments: args}) do
+    {:tool_loop, to_string(name), :erlang.phash2(args)}
+  end
+
+  defp maybe_inject_loop_breaker_nudge(state, results) do
+    triggers =
+      Enum.flat_map(results, fn {tool_call, result} ->
+        if failure_to_bump?(result) and
+             failure_count_at_least?(
+               state,
+               tool_failure_key(tool_call),
+               @tool_loop_breaker_threshold
+             ) and
+             never_nudged_recently?(state, tool_failure_key(tool_call)) do
+          record_nudge(state, tool_failure_key(tool_call))
+          [tool_call]
+        else
+          []
+        end
+      end)
+
+    Enum.reduce(triggers, state, fn tool_call, acc -> inject_nudge(acc, tool_call) end)
+  end
+
+  defp failure_to_bump?({:error, %ToolError{kind: :transport_failure}}), do: true
+  defp failure_to_bump?({:error, %ToolError{kind: :execution}}), do: true
+  defp failure_to_bump?(_), do: false
+
+  defp failure_count_at_least?(state, key, threshold) do
+    case :ets.lookup(state.tool_state, key) do
+      [{^key, count}] -> count >= threshold
+      _ -> false
+    end
+  end
+
+  defp never_nudged_recently?(state, key) do
+    case :ets.lookup(state.tool_state, {:tool_loop_nudge_at, key}) do
+      [] -> true
+      [{_, ts}] -> System.monotonic_time(:millisecond) - ts > @tool_loop_breaker_window_ms
+      _ -> true
+    end
+  end
+
+  defp record_nudge(state, key) do
+    :ets.insert(
+      state.tool_state,
+      {{:tool_loop_nudge_at, key}, System.monotonic_time(:millisecond)}
+    )
+
+    :ets.delete(state.tool_state, key)
+  end
+
+  defp inject_nudge(state, tool_call) do
+    text =
+      "[Loop breaker] The tool `#{tool_call.name}` has failed #{@tool_loop_breaker_threshold} times " <>
+        "in a row. Stop calling it and either pick a different tool, ask the user, or " <>
+        "report the failure. Arguments: #{inspect(tool_call.arguments)}."
+
+    msg = Message.user("loop_breaker_#{System.unique_integer([:positive])}", text)
+    state = %{state | messages: state.messages ++ [msg]}
+    emit(state, {:message_start, msg})
+    emit(state, {:message_end, msg})
+    state
+  end
 
   defp ai_to_agent_message(ai_msg, id) do
     ai_to_agent_message(ai_msg, id, nil)

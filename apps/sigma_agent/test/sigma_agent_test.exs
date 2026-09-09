@@ -307,6 +307,69 @@ defmodule Sigma.AgentTest do
     def execute(_tool_call_id, _params, _opts), do: raise("tool exploded")
   end
 
+  defmodule LoopBreakerProvider do
+    @behaviour Sigma.Ai.Provider
+
+    @impl true
+    def stream(params) do
+      tool_result_count = Enum.count(params.context.messages, &(&1.role == :tool_result))
+
+      content =
+        if tool_result_count < 3 do
+          [
+            %{
+              type: :tool_call,
+              id: "tc_loop_#{tool_result_count}",
+              name: "mcp__test__fail",
+              arguments: %{"query" => "same"}
+            }
+          ]
+        else
+          [%{type: :text, text: "Stopped"}]
+        end
+
+      stop_reason = if tool_result_count < 3, do: :tool_use, else: :stop
+      msg = ai_msg(content, stop_reason)
+      [{:start, msg}, {:done, stop_reason, msg}]
+    end
+
+    defp ai_msg(content, stop_reason) do
+      %{
+        role: :assistant,
+        content: content,
+        model: "mock-model",
+        provider: "mock-provider",
+        api: "mock-api",
+        usage: %{
+          input: 0,
+          output: 0,
+          cache_read: 0,
+          cache_write: 0,
+          total_tokens: 0,
+          cost: %{input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0, total: 0.0}
+        },
+        stop_reason: stop_reason,
+        timestamp: System.system_time(:millisecond)
+      }
+    end
+  end
+
+  defmodule TransportFailureTool do
+    @behaviour Sigma.Coding.Tool
+
+    @impl true
+    def name, do: "mcp__test__fail"
+    @impl true
+    def description, do: "Always fails at the transport boundary."
+    @impl true
+    def schema, do: %{"type" => "object", "properties" => %{}}
+
+    @impl true
+    def execute(_tool_call_id, _params, _opts) do
+      {:transport_failure, "Send failure", name(), "test", %{original_reason: :closed}}
+    end
+  end
+
   test "agent manages a turn and emits events" do
     model = %{id: "mock-model", api: "mock-api", provider: "mock-provider"}
 
@@ -362,6 +425,7 @@ defmodule Sigma.AgentTest do
                       kind: :malformed_stream,
                       message: "stream_ended_without_terminal"
                     }}
+
     assert_receive {:agent_end, [%Message{role: :user, content: "Hi"}]}
   end
 
@@ -554,6 +618,32 @@ defmodule Sigma.AgentTest do
              _message ->
                false
            end)
+  end
+
+  test "injects a loop-breaker nudge after three identical transport failures" do
+    model = %{id: "mock-model", api: "mock-api", provider: "mock-provider"}
+
+    {:ok, agent} =
+      Sigma.Agent.start_link(
+        model: model,
+        provider: LoopBreakerProvider,
+        tools: [TransportFailureTool]
+      )
+
+    Sigma.Agent.subscribe(agent)
+    Sigma.Agent.prompt(agent, "Hi")
+
+    assert_receive {:message_end, %Message{role: :user, content: "[Loop breaker]" <> _ = nudge}},
+                   3_000
+
+    assert nudge =~ "`mcp__test__fail` has failed 3 times"
+    assert_receive {:agent_end, messages}, 3_000
+    assert Enum.count(messages, &(&1.role == :tool_result)) == 3
+
+    assert Enum.count(
+             messages,
+             &match?(%Message{role: :user, content: "[Loop breaker]" <> _}, &1)
+           ) == 1
   end
 
   test "tool transcript path uses the provided transcript path" do

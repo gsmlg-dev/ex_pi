@@ -20,8 +20,12 @@ defmodule Sigma.Agent.Stdio do
 
   defp read_lines(input, owner) do
     case IO.read(input, :line) do
-      :eof -> send(owner, {:stdio_eof, self()})
-      {:error, reason} -> send(owner, {:stdio_read_error, self(), reason})
+      :eof ->
+        send(owner, {:stdio_eof, self()})
+
+      {:error, reason} ->
+        send(owner, {:stdio_read_error, self(), reason})
+
       line when is_binary(line) ->
         send(owner, {:stdio_line, self(), line})
         read_lines(input, owner)
@@ -67,7 +71,6 @@ defmodule Sigma.Agent.Stdio do
         case PublicRuntime.execute(command, state.context) do
           {:ok, event} -> write_event(state.output, event)
           {:error, %Envelope{} = event} -> write_event(state.output, event)
-          {:error, reason} -> write_protocol_error(state.output, reason)
         end
 
       {:ok, %Envelope{}} ->
