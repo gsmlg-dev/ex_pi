@@ -11,13 +11,18 @@ defmodule Sigma.Web.ProtocolSessionOptions do
          {:ok, provider} <- provider_module(config),
          model_id when is_binary(model_id) and model_id != "" <- config["model"] do
       effective_cwd = metadata["cwd"] || snapshot.cwd || workdir
-      mcp_ids = snapshot.mcp_server_ids ++ List.wrap(metadata["mcp_server_ids"] || RepoManager.mcp_server_ids(workdir))
+
+      mcp_ids =
+        snapshot.mcp_server_ids ++
+          List.wrap(metadata["mcp_server_ids"] || RepoManager.mcp_server_ids(workdir))
+
       mcp_ids = Enum.uniq(mcp_ids)
       discovery = Sigma.Session.ContextFiles.discover(nil, effective_cwd)
+      skills_catalog = Skills.Catalog.build(effective_cwd)
 
       session_context =
         SessionContext.new(
-          skills: [Skills.list_global().skills, Skills.list_repository(effective_cwd).skills] |> List.flatten(),
+          skills: skills_catalog.skills,
           agents_context: [ConfigManager.get_config()["system_prompt"], discovery.content],
           current_date: Date.utc_today()
         )
@@ -57,8 +62,12 @@ defmodule Sigma.Web.ProtocolSessionOptions do
 
   defp provider_module(%{"api_type" => "anthropic"}), do: {:ok, Sigma.Ai.Providers.Anthropic}
   defp provider_module(%{"api_type" => "openai"}), do: {:ok, Sigma.Ai.Providers.OpenAIResponses}
-  defp provider_module(%{"api_type" => "openai-responses"}), do: {:ok, Sigma.Ai.Providers.OpenAIResponses}
-  defp provider_module(%{"api_type" => "openai-completions"}), do: {:ok, Sigma.Ai.Providers.OpenAI}
+
+  defp provider_module(%{"api_type" => "openai-responses"}),
+    do: {:ok, Sigma.Ai.Providers.OpenAIResponses}
+
+  defp provider_module(%{"api_type" => "openai-completions"}),
+    do: {:ok, Sigma.Ai.Providers.OpenAI}
 
   defp provider_module(_config) do
     case Application.get_env(:sigma_web, :mock_provider_module) do
@@ -78,7 +87,9 @@ defmodule Sigma.Web.ProtocolSessionOptions do
     ]
   end
 
-  defp default_auth_type(api_type) when api_type in ["openai", "openai-responses", "openai-completions"], do: "bearer"
+  defp default_auth_type(api_type)
+       when api_type in ["openai", "openai-responses", "openai-completions"], do: "bearer"
+
   defp default_auth_type(_api_type), do: "x-api-key"
 
   defp agent_model(config, model_id) do

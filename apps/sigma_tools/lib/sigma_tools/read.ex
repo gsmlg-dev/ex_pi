@@ -39,7 +39,11 @@ defmodule Sigma.Tools.Read do
     limit = Map.get(params, "limit")
     cwd = Keyword.get(opts, :cwd, File.cwd!())
 
-    with {:ok, absolute_path} <- PathUtils.safe_resolve(path, cwd, allow_skill_files?: true),
+    with {:ok, absolute_path} <-
+           PathUtils.safe_resolve(path, cwd,
+             allow_skill_files?: true,
+             skill_roots: Keyword.get(opts, :skill_roots, [])
+           ),
          {:ok, raw} <- read_file(absolute_path) do
       {_bom, text} = Hashline.strip_bom(raw)
       normalized = Hashline.normalize_to_lf(text)

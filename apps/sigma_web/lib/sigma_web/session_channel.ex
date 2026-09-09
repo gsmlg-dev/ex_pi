@@ -6,6 +6,7 @@ defmodule Sigma.Web.SessionChannel do
   alias Sigma.Agent.{ProtocolSubscription, PublicRuntime}
   alias Sigma.Protocol.{Codec, Envelope, Error}
   alias Sigma.Session.SessionFiles
+  alias Sigma.Session.{SkillInvocationStore, SlashCommands}
 
   @impl true
   def join("session:" <> session_id, _payload, socket) do
@@ -65,8 +66,24 @@ defmodule Sigma.Web.SessionChannel do
       sessions_dir: socket.assigns.sessions_dir,
       subscriber: self(),
       interactive_approvals: true,
-      session_opts: protocol_session_opts(socket)
+      session_opts: protocol_session_opts(socket),
+      session_id: socket.assigns.session_id,
+      skill_invocation_store: %{
+        find: fn session_id, request_key ->
+          SkillInvocationStore.find(socket.assigns.sessions_dir, session_id, request_key)
+        end,
+        list: fn session_id -> SkillInvocationStore.list(socket.assigns.sessions_dir, session_id) end,
+        reserve: fn session_id, record ->
+          SkillInvocationStore.reserve(socket.assigns.sessions_dir, session_id, record)
+        end,
+        update: fn session_id, invocation_id, changes ->
+          SkillInvocationStore.update(socket.assigns.sessions_dir, session_id, invocation_id, changes)
+        end
+      },
+      skill_expander: &SlashCommands.expand/2
     }
+
+    context = Map.merge(context, Sigma.Agent.SkillInvocationService.callbacks(context))
 
     result = PublicRuntime.execute(command, context)
     {result, track_subscription(socket, command, result)}

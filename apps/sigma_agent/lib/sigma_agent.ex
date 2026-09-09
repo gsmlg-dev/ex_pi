@@ -1213,6 +1213,14 @@ defmodule Sigma.Agent do
     kind, reason -> {:error, {:state_change_failure, kind, reason}}
   end
 
+  defp skill_grant_roots(table, turn_id) do
+    :ets.match_object(table, {{:skill_activation, turn_id, :_}, %{resource_root: :_}})
+    |> Enum.map(fn {_key, %{resource_root: root}} -> root end)
+    |> Enum.uniq()
+  rescue
+    _ -> []
+  end
+
   defp execute_tools(state, tool_calls) do
     Enum.each(tool_calls, fn tc ->
       emit(state, {:tool_execution_start, tc.id, tc.name, tc.arguments})
@@ -1226,6 +1234,8 @@ defmodule Sigma.Agent do
       |> Keyword.put(:permission_policy, resolve_policy(state.policy))
       |> Keyword.put(:session_id, state.session_id)
       |> Keyword.put(:log_session_id, state.log_session_id)
+      |> Keyword.put(:turn_id, state.turn_state.turn_id)
+      |> Keyword.put(:skill_roots, skill_grant_roots(state.tool_state, state.turn_state.turn_id))
       |> Keyword.put(:transcript_path, transcript_path(state))
       |> Keyword.put(:hook_specs, state.hook_specs)
       |> Keyword.put(:tool_state, state.tool_state)

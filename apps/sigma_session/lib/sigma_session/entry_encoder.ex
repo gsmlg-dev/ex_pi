@@ -77,6 +77,10 @@ defmodule Sigma.Session.EntryEncoder do
     {:ok, entry("branch_summary", parent_id, %{"fromId" => from_id, "summary" => summary})}
   end
 
+  def encode({:skill_invocation, invocation}, parent_id, _header?) when is_map(invocation) do
+    {:ok, entry("skill_invocation", parent_id, %{"invocation" => invocation})}
+  end
+
   def encode(_event, _parent_id, _header?), do: :ignored
 
   defp entry(type, parent_id, payload) do

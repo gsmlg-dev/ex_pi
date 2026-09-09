@@ -10,6 +10,20 @@ defmodule Sigma.Web.Router do
     plug(:put_secure_browser_headers)
   end
 
+  pipeline :api do
+    plug(:accepts, ["json"])
+  end
+
+  scope "/api/v1", Sigma.Web do
+    pipe_through(:api)
+
+    get("/capabilities", SkillsController, :capabilities)
+    get("/skills", SkillsController, :index)
+    get("/skills/:id", SkillsController, :show)
+    post("/sessions/:session_id/skill-invocations", SkillsController, :create_invocation)
+    get("/sessions/:session_id/skill-invocations/:invocation_id", SkillsController, :show_invocation)
+  end
+
   scope "/", Sigma.Web do
     pipe_through(:browser)
 

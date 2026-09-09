@@ -28,4 +28,21 @@ defmodule Sigma.Session.SlashCommandsTest do
   test "rejects unknown slash commands" do
     assert SlashCommands.expand("/compact") == {:error, "Unknown slash command: /compact"}
   end
+
+  @tag :tmp_dir
+  test "invokes a local skill and expands arguments once", %{tmp_dir: tmp_dir} do
+    skill_dir = Path.join([tmp_dir, ".agents", "skills", "example"])
+    File.mkdir_p!(skill_dir)
+
+    File.write!(
+      Path.join(skill_dir, "SKILL.md"),
+      "---\nname: example\ndescription: Example skill\n---\nDo $ARGUMENTS once."
+    )
+
+    assert {:ok, "Do inspect this once."} =
+             SlashCommands.expand("/skill example inspect this", cwd: tmp_dir)
+
+    assert {:ok, "Do inspect this once."} =
+             SlashCommands.expand("/example inspect this", cwd: tmp_dir)
+  end
 end

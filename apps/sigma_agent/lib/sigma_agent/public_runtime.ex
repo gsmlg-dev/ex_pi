@@ -239,8 +239,22 @@ defmodule Sigma.Agent.PublicRuntime do
   defp resume(command, context, repo_path, storage_path) do
     with {:ok, snapshot} <- apply(Sigma.Session.Log, :snapshot, [storage_path]),
          :ok <- require_session_header(snapshot),
+         :ok <- recover_skill_invocations(context, command.session_id),
          :ok <- ensure_runtime_session(command, context, repo_path, storage_path, snapshot) do
       snapshot_event(command.session_id, snapshot)
+    end
+  end
+
+  defp recover_skill_invocations(context, session_id) do
+    case context[:sessions_dir] do
+      sessions_dir when is_binary(sessions_dir) ->
+        case apply(Sigma.Session.SkillInvocationStore, :recover, [sessions_dir, session_id]) do
+          {:ok, _records} -> :ok
+          {:error, reason} -> {:error, {:skill_invocation_recovery_failed, reason}}
+        end
+
+      _ ->
+        :ok
     end
   end
 

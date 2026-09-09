@@ -85,4 +85,16 @@ defmodule Sigma.Session.EntryEncoderTest do
     assert :ignored = EntryEncoder.encode({:turn_start}, nil, false)
     assert :ignored = EntryEncoder.encode({:agent_start, "/repo"}, nil, true)
   end
+
+  test "encodes skill invocation records as durable journal entries" do
+    assert {:ok, entry} =
+             EntryEncoder.encode(
+               {:skill_invocation, %{"requestId" => "inv-1", "state" => "preparing"}},
+               "active-leaf",
+               true
+             )
+
+    assert entry["type"] == "skill_invocation"
+    assert entry["invocation"]["requestId"] == "inv-1"
+  end
 end

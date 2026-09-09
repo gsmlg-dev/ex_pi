@@ -10,6 +10,21 @@ defmodule Sigma.Coding.Utils.PathUtilsTest do
       assert resolved == Path.expand("mix.exs", @cwd)
     end
 
+    test "allows any file under an activated skill root" do
+      tmp = System.tmp_dir!()
+      cwd = Path.join(tmp, "pi_grant_cwd_#{System.unique_integer([:positive])}")
+      skill_root = Path.join(tmp, "pi_grant_skill_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(Path.join(skill_root, "references"))
+      resource = Path.join([skill_root, "references", "guide.md"])
+      File.write!(resource, "guide")
+
+      on_exit(fn -> File.rm_rf!(cwd); File.rm_rf!(skill_root) end)
+
+      assert {:error, _reason} = PathUtils.safe_resolve(resource, cwd)
+      assert {:ok, resolved} = PathUtils.safe_resolve(resource, cwd, skill_roots: [skill_root])
+      assert String.ends_with?(resolved, "/references/guide.md")
+    end
+
     test "resolves absolute path within cwd" do
       abs_path = Path.expand("mix.exs", @cwd)
       assert {:ok, resolved} = PathUtils.safe_resolve(abs_path, @cwd)

@@ -26,7 +26,8 @@ defmodule Sigma.ToolsTest do
              "edit",
              "search",
              "find",
-             "todo"
+             "todo",
+             "activate_skill"
            ]
   end
 
@@ -69,5 +70,48 @@ defmodule Sigma.ToolsTest do
     assert definition.description =~ "replace N..M:"
     assert input_schema["description"] =~ "Do not send unified diff"
     assert input_schema["description"] =~ "replace N..M:"
+  end
+
+  @tag :tmp_dir
+  test "activate_skill resolves and prepares an enabled local skill", %{tmp_dir: tmp_dir} do
+    skill_dir = Path.join([tmp_dir, ".agents", "skills", "example"])
+    File.mkdir_p!(skill_dir)
+
+    File.write!(
+      Path.join(skill_dir, "SKILL.md"),
+      "---\nname: example\ndescription: Example\n---\nUse $ARGUMENTS."
+    )
+
+    assert {:ok, result} =
+             Sigma.Tools.ActivateSkill.execute("id", %{"reference" => "example", "arguments" => "carefully"}, cwd: tmp_dir)
+
+    assert [%{type: :text, text: "Use carefully."}] = result.content
+    assert result.details.digest.scheme == "sha256-tree-v1"
+    assert result.details.manifest != []
+  end
+
+  @tag :tmp_dir
+  test "activate_skill deduplicates successful activation within a turn", %{tmp_dir: tmp_dir} do
+    skill_dir = Path.join([tmp_dir, ".agents", "skills", "example"])
+    File.mkdir_p!(skill_dir)
+    File.write!(Path.join(skill_dir, "SKILL.md"), "---\nname: example\ndescription: Example\n---\nBody")
+    table = :ets.new(:skill_activation_test, [:set, :public])
+    opts = [cwd: tmp_dir, tool_state: table, turn_id: "turn-1"]
+
+    assert {:ok, %{content: [%{text: "Body"}]}} =
+             Sigma.Tools.ActivateSkill.execute("id-1", %{"reference" => "example"}, opts)
+
+    assert {:ok, %{details: %{deduplicated?: true}}} =
+             Sigma.Tools.ActivateSkill.execute("id-2", %{"reference" => "example"}, opts)
+  end
+
+  @tag :tmp_dir
+  test "activate_skill rejects manual-only skills", %{tmp_dir: tmp_dir} do
+    skill_dir = Path.join([tmp_dir, ".agents", "skills", "manual"])
+    File.mkdir_p!(skill_dir)
+    File.write!(Path.join(skill_dir, "SKILL.md"), "---\nname: manual\ndescription: Manual\ndisable-model-invocation: true\n---\nBody")
+
+    assert {:error, %Sigma.Coding.ToolError{kind: :manual_invocation_required}} =
+             Sigma.Tools.ActivateSkill.execute("id", %{"reference" => "manual"}, cwd: tmp_dir)
   end
 end

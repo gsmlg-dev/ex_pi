@@ -6,7 +6,7 @@ defmodule Sigma.Web.NewSessionLive do
   import Sigma.Web.ProjectSidebar
 
   @impl true
-  def mount(%{"repository" => encoded_repository}, _session, socket) do
+  def mount(%{"repository" => encoded_repository} = params, _session, socket) do
     case fetch_registered_repo(encoded_repository) do
       {:ok, workdir, _repo} ->
         sessions_dir = get_sessions_dir(workdir)
@@ -27,6 +27,7 @@ defmodule Sigma.Web.NewSessionLive do
           |> assign(:selected_mcp_server_ids, [])
           |> assign(:model_options, [])
           |> assign(:selected_model_value, nil)
+          |> assign(:skill_reference, params["skill"])
           |> assign(:session_options_loading, true)
           |> assign(:session_options, AsyncResult.loading())
           |> start_async(:session_options, fn -> load_session_options(workdir) end)
@@ -117,6 +118,15 @@ defmodule Sigma.Web.NewSessionLive do
           </div>
 
           <div class="space-y-6">
+            <div
+              :if={@skill_reference not in [nil, ""]}
+              class="rounded-xl border border-primary/30 bg-primary/5 p-4 text-sm text-on-surface"
+            >
+              <p class="font-semibold">Skill selected</p>
+              <code class="mt-1 block font-mono text-xs">/{@skill_reference}</code>
+              <p class="mt-2 text-on-surface-variant">Create the session, then review and send the preselected skill command from the chat composer.</p>
+            </div>
+
             <div
               :if={@session_options_loading}
               class="rounded-xl border border-outline-variant bg-surface-container-low p-4"

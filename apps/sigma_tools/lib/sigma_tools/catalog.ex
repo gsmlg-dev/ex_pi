@@ -13,6 +13,7 @@ defmodule Sigma.Tools.Catalog do
     %{name: "find", category: :file, module: Sigma.Tools.Find, status: :implemented},
     %{name: "job", category: :runtime, module: Sigma.Tools.Job, status: :planned},
     %{name: "todo", category: :coordination, module: Sigma.Tools.Todo, status: :implemented},
+    %{name: "activate_skill", category: :coordination, module: Sigma.Tools.ActivateSkill, status: :implemented},
     %{name: "task", category: :coordination, module: Sigma.Tools.Task, status: :planned},
     %{name: "lsp", category: :code_intel, module: Sigma.Tools.LSP, status: :planned},
     %{name: "ast_grep", category: :code_intel, module: Sigma.Tools.ASTGrep, status: :planned},

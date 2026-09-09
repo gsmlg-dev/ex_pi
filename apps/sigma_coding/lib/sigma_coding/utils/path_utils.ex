@@ -100,9 +100,21 @@ defmodule Sigma.Coding.Utils.PathUtils do
   end
 
   defp allowed_external_path?(path, real_path, opts) do
-    Keyword.get(opts, :allow_skill_files?, false) and
-      Path.basename(path) == "SKILL.md" and
-      Path.basename(real_path) == "SKILL.md" and
-      File.regular?(real_path)
+    granted_root_path?(real_path, opts) or
+      (Keyword.get(opts, :allow_skill_files?, false) and
+         Path.basename(path) == "SKILL.md" and
+         Path.basename(real_path) == "SKILL.md" and
+         File.regular?(real_path))
+  end
+
+  defp granted_root_path?(real_path, opts) do
+    opts
+    |> Keyword.get(:skill_roots, [])
+    |> Enum.any?(fn root ->
+      case resolve_real_path(root) do
+        {:ok, real_root} -> within_cwd?(real_path, real_root)
+        _ -> false
+      end
+    end)
   end
 end

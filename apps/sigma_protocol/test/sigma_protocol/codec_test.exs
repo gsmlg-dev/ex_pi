@@ -61,4 +61,22 @@ defmodule Sigma.Protocol.CodecTest do
 
     assert {:error, :payload_too_large} = Codec.encode(event)
   end
+
+  test "round trips the additive skills.v1 command and event" do
+    assert {:ok, command} =
+             Envelope.command("skill.invoke", "session-1", %{
+               "repositoryId" => "repo-1",
+               "reference" => "global:review",
+               "arguments" => "check"
+             })
+
+    assert {:ok, encoded} = Codec.encode(command)
+    assert {:ok, ^command} = Codec.decode(encoded)
+
+    assert {:ok, event} =
+             Envelope.event("skill.invocation.updated", "session-1", %{"state" => "queued"})
+
+    assert {:ok, encoded} = Codec.encode(event)
+    assert {:ok, ^event} = Codec.decode(encoded)
+  end
 end

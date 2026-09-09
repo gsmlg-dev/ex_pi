@@ -4,6 +4,7 @@ defmodule Sigma.Session.SlashCommands do
   """
 
   @init_command "init"
+  alias Sigma.Session.Skills.Catalog
   @init_prompt """
   Set up a minimal AGENTS.md, and optionally Sigma Agent skills and supported hooks, for this repo. AGENTS.md instructions are loaded into Sigma Agent sessions, so the file must stay concise: only include what Sigma Agent would get wrong without it.
 
@@ -193,22 +194,58 @@ defmodule Sigma.Session.SlashCommands do
   Then present a short to-do list with only relevant follow-ups, ordered by impact.
   """
 
-  @spec expand(String.t()) :: :not_command | {:ok, String.t()} | {:error, String.t()}
-  def expand(text) when is_binary(text) do
+  @spec expand(String.t(), keyword()) :: :not_command | {:ok, String.t()} | {:error, String.t()}
+  def expand(text, opts \\ []) when is_binary(text) do
     text
     |> String.trim()
-    |> do_expand()
+    |> do_expand(opts)
   end
 
-  defp do_expand(""), do: :not_command
-  defp do_expand("/" <> command), do: expand_command(command)
-  defp do_expand(_text), do: :not_command
+  defp do_expand("", _opts), do: :not_command
+  defp do_expand("/" <> command, opts), do: expand_command(command, opts)
+  defp do_expand(_text, _opts), do: :not_command
 
-  defp expand_command(command) do
+  defp expand_command(command, opts) do
     case String.split(command, ~r/\s+/, trim: true) do
       [@init_command | args] -> {:ok, init_prompt(Enum.join(args, " "))}
-      [unknown | _args] -> {:error, "Unknown slash command: /#{unknown}"}
+      ["skill", reference | args] -> invoke_skill(reference, Enum.join(args, " "), opts, true)
+      [reference | args] -> invoke_skill(reference, Enum.join(args, " "), opts, false)
       [] -> {:error, "Unknown slash command: /"}
+    end
+  end
+
+  defp invoke_skill(reference, arguments, opts, explicit?) do
+    cwd = Keyword.get(opts, :cwd, File.cwd!())
+
+    case Catalog.resolve(Catalog.build(cwd), reference) do
+      {:ok, skill} ->
+        with {:ok, content} <- File.read(skill.path) do
+          {:ok, expand_skill_body(content, arguments)}
+        else
+          {:error, reason} -> {:error, "Could not read skill #{skill.name}: #{reason}"}
+        end
+
+      {:error, :skill_not_found} ->
+        if explicit?, do: {:error, "Skill not found: #{reference}"}, else: {:error, "Unknown slash command: /#{reference}"}
+      {:error, :ambiguous_skill} -> {:error, "Skill reference is ambiguous: #{reference}"}
+      {:error, :skill_disabled} -> {:error, "Skill is disabled: #{reference}"}
+    end
+  end
+
+  defp expand_skill_body(content, arguments) do
+    body = skill_body(content)
+
+    if String.contains?(body, "$ARGUMENTS") do
+      String.replace(body, "$ARGUMENTS", arguments)
+    else
+      if arguments == "", do: body, else: body <> "\n\nSkill arguments:\n" <> arguments
+    end
+  end
+
+  defp skill_body(content) do
+    case String.split(String.replace(content, "\r\n", "\n"), "\n---\n", parts: 2) do
+      ["---\n" <> _metadata, body] -> String.trim(body)
+      _ -> String.trim(content)
     end
   end
 

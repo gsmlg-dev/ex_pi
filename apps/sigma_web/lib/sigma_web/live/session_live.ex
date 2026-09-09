@@ -512,14 +512,7 @@ defmodule Sigma.Web.SessionLive do
             id="chat-input-area"
             phx-hook="ChatInputHook"
             data-slash-commands={
-              Jason.encode!([
-                %{value: "/init", label: "/init", description: "Create or update AGENTS.md"},
-                %{
-                  value: "/reload-tools",
-                  label: "/reload-tools",
-                  description: "Reconnect MCP servers and refresh their tools"
-                }
-              ])
+              Jason.encode!(slash_commands(assigns[:effective_cwd]))
             }
             class="relative mx-auto max-w-4xl"
           >
@@ -1600,7 +1593,12 @@ defmodule Sigma.Web.SessionLive do
          )}
 
       {:error, :session_busy} ->
-        {:noreply, put_flash(socket, :error, "Wait for the active turn to finish before switching sessions.")}
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Wait for the active turn to finish before switching sessions."
+         )}
 
       {:error, :invalid_session_id} ->
         {:noreply, put_flash(socket, :error, "Invalid session id")}
@@ -1631,6 +1629,7 @@ defmodule Sigma.Web.SessionLive do
           {:ok, _deleted} ->
             {:ok, sessions} =
               Sigma.Session.Log.list_session_summaries(socket.assigns.sessions_dir)
+
             socket = assign(socket, :sessions, sessions)
 
             if s == socket.assigns.session_id do
@@ -1669,6 +1668,7 @@ defmodule Sigma.Web.SessionLive do
         {:ok, _renamed} ->
           {:ok, sessions} =
             Sigma.Session.Log.list_session_summaries(socket.assigns.sessions_dir)
+
           socket = assign(socket, :sessions, sessions)
 
           if old_id == socket.assigns.session_id do
@@ -1959,7 +1959,7 @@ defmodule Sigma.Web.SessionLive do
   end
 
   defp handle_prompt(prompt, socket) do
-    case SlashCommands.expand(prompt) do
+    case SlashCommands.expand(prompt, cwd: socket.assigns.effective_cwd) do
       :not_command ->
         prompt_admission(socket, submit_prompt(socket, prompt))
 
@@ -2495,7 +2495,9 @@ defmodule Sigma.Web.SessionLive do
     ]
   end
 
-  defp default_auth_type(api_type) when api_type in ["openai", "openai-responses", "openai-completions"], do: "bearer"
+  defp default_auth_type(api_type)
+       when api_type in ["openai", "openai-responses", "openai-completions"], do: "bearer"
+
   defp default_auth_type(_api_type), do: "x-api-key"
 
   defp session_menu_button_id(session_id) do
@@ -2541,8 +2543,26 @@ defmodule Sigma.Web.SessionLive do
   defp logs_topic(repo_key, session_id), do: "sigma:logs:#{repo_key}:#{session_id}"
 
   defp session_skills_context(effective_cwd) do
-    [Skills.list_global().skills, Skills.list_repository(effective_cwd).skills]
-    |> List.flatten()
+    Skills.Catalog.build(effective_cwd).skills
+  end
+
+  defp slash_commands(cwd) do
+    builtins = [
+      %{value: "/init", label: "/init", description: "Create or update AGENTS.md"},
+      %{value: "/reload-tools", label: "/reload-tools", description: "Reconnect MCP servers and refresh their tools"}
+    ]
+
+    skills =
+      cwd
+      |> Kernel.||(".")
+      |> Skills.Catalog.build()
+      |> Map.get(:skills, [])
+      |> Enum.filter(& &1.enabled?)
+      |> Enum.map(fn skill ->
+        %{value: "/#{skill.name}", label: "/#{skill.name}", description: skill.description}
+      end)
+
+    builtins ++ skills
   end
 
   defp read_session_meta(meta_path) do

@@ -20,6 +20,9 @@ defmodule Sigma.Protocol.Envelope do
     permission.resolve
     mcp.elicitation.resolve
     model.select
+    skill.invoke
+    skill.invocation.status
+    skill.invocation.cancel
     subscription.attach
     subscription.detach
   )
@@ -39,6 +42,7 @@ defmodule Sigma.Protocol.Envelope do
     turn.failed
     turn.cancelled
     session.error
+    skill.invocation.updated
   )
 
   @enforce_keys [:version, :id, :session_id, :timestamp, :type, :kind]

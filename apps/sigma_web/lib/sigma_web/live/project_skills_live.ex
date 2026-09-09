@@ -81,6 +81,13 @@ defmodule Sigma.Web.ProjectSkillsLive do
                 <code class="block text-[11px] font-mono text-on-surface-variant break-all bg-surface-container-high rounded-lg p-3">
                   {skill.path}
                 </code>
+                <.dm_link
+                  navigate={~p"/repository/#{@encoded_repository}/sessions/new?skill=#{skill.name}"}
+                  class="btn btn-primary btn-sm"
+                >
+                  <.dm_mdi name="message-text-outline" class="w-4 h-4" />
+                  Use in new session
+                </.dm_link>
               </div>
             </.dm_card>
           </div>

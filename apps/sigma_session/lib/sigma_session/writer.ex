@@ -204,5 +204,6 @@ defmodule Sigma.Session.Writer do
   defp entry_type("mcp_server_selection_change"), do: :mcp_server_selection_change
   defp entry_type("mode_change"), do: :mode_change
   defp entry_type("branch_summary"), do: :branch_summary
+  defp entry_type("skill_invocation"), do: :skill_invocation
   defp entry_type(_type), do: :unknown
 end

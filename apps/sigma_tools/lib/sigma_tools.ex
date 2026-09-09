@@ -12,7 +12,8 @@ defmodule Sigma.Tools do
       Sigma.Tools.Edit,
       Sigma.Tools.Search,
       Sigma.Tools.Find,
-      Sigma.Tools.Todo
+      Sigma.Tools.Todo,
+      Sigma.Tools.ActivateSkill
     ]
   end
 

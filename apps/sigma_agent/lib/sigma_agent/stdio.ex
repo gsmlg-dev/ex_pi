@@ -9,6 +9,7 @@ defmodule Sigma.Agent.Stdio do
   def run(input \\ :stdio, output \\ :stdio, context \\ %{}) when is_map(context) do
     owner = self()
     reader = spawn_link(fn -> read_lines(input, owner) end)
+    context = Map.merge(context, Sigma.Agent.SkillInvocationService.callbacks(context))
 
     loop(%{
       context: Map.put(context, :subscriber, owner),
