@@ -2,6 +2,177 @@ defmodule Sigma.Ai.Providers.OpenAITest do
   use ExUnit.Case, async: true
 
   alias Sigma.Ai.{ProviderError, Providers.OpenAI}
+  alias Sigma.Ai.Providers.OpenAIResponses
+
+  test "streams Responses API text and uses Responses request fields" do
+    sse = [
+      sse_json(%{"type" => "response.created", "response" => %{"id" => "resp_1"}}),
+      sse_json(%{"type" => "response.output_text.delta", "delta" => "hello"}),
+      sse_json(%{
+        "type" => "response.completed",
+        "response" => %{
+          "status" => "completed",
+          "usage" => %{
+            "input_tokens" => 10,
+            "output_tokens" => 2,
+            "input_token_details" => %{"cached_tokens" => 3}
+          }
+        }
+      }),
+      "data: [DONE]\n\n"
+    ]
+
+    with_request_capture_server(sse, fn base_url, captured ->
+      events =
+        Sigma.Ai.Providers.OpenAIResponses.stream(%{
+          model: %{id: "gpt-5", api: "openai", provider: "openai"},
+          context: %{
+            messages: [%{role: :user, content: "Hi"}],
+            system_prompt: "Be concise",
+            tools: []
+          },
+          options: [api_key: "test-key", base_url: base_url, receive_timeout: 1_000]
+        })
+        |> Enum.to_list()
+
+      body = Agent.get(captured, & &1.body)
+      assert body["input"]
+      refute Map.has_key?(body, "messages")
+      assert body["store"] == false
+      assert body["stream"] == true
+      assert body["input"] |> hd() |> Map.get("role") == "system"
+      assert {:done, :stop, message} = Enum.find(events, &match?({:done, _, _}, &1))
+      assert message.response_id == "resp_1"
+      assert message.usage.input == 7
+      assert message.usage.cache_read == 3
+    end)
+  end
+
+  test "completes Responses API function calls after output item metadata arrives" do
+    arguments = "{\"path\":\"README.md\"}"
+
+    sse = [
+      sse_json(%{"type" => "response.created", "response" => %{"id" => "resp_tool"}}),
+      sse_json(%{
+        "type" => "response.output_item.added",
+        "item" => %{
+          "type" => "function_call",
+          "id" => "item_1",
+          "call_id" => "call_1",
+          "name" => "read",
+          "arguments" => ""
+        }
+      }),
+      sse_json(%{
+        "type" => "response.function_call_arguments.delta",
+        "item_id" => "item_1",
+        "delta" => "{\"path\":"
+      }),
+      sse_json(%{
+        "type" => "response.function_call_arguments.delta",
+        "item_id" => "item_1",
+        "delta" => "\"README.md\"}"
+      }),
+      sse_json(%{
+        "type" => "response.function_call_arguments.done",
+        "item_id" => "item_1",
+        "arguments" => arguments
+      }),
+      sse_json(%{
+        "type" => "response.output_item.done",
+        "item" => %{
+          "type" => "function_call",
+          "id" => "item_1",
+          "call_id" => "call_1",
+          "name" => "read",
+          "arguments" => arguments
+        }
+      }),
+      sse_json(%{
+        "type" => "response.completed",
+        "response" => %{"status" => "completed", "usage" => %{}}
+      }),
+      "data: [DONE]\n\n"
+    ]
+
+    with_sse_server(sse, fn base_url ->
+      events =
+        OpenAIResponses.stream(%{
+          model: %{id: "gpt-5", api: "openai", provider: "openai"},
+          context: %{messages: [], system_prompt: nil, tools: []},
+          options: [api_key: "test-key", base_url: base_url, receive_timeout: 1_000]
+        })
+        |> Enum.to_list()
+
+      assert {:toolcall_end, 0,
+              %{id: "call_1", name: "read", arguments: %{"path" => "README.md"}}, _} =
+               Enum.find(events, &match?({:toolcall_end, _, _, _}, &1))
+
+      assert {:done, :tool_use, %{content: [%{id: "call_1", name: "read"}]}} =
+               Enum.find(events, &match?({:done, _, _}, &1))
+    end)
+  end
+
+  test "normalizes Responses API reasoning summary deltas" do
+    sse = [
+      sse_json(%{"type" => "response.reasoning_summary_text.delta", "delta" => "thinking"}),
+      sse_json(%{"type" => "response.completed", "response" => %{"status" => "completed"}}),
+      "data: [DONE]\n\n"
+    ]
+
+    with_sse_server(sse, fn base_url ->
+      events =
+        OpenAIResponses.stream(%{
+          model: %{id: "gpt-5", api: "openai", provider: "openai"},
+          context: %{messages: [], system_prompt: nil, tools: []},
+          options: [api_key: "test-key", base_url: base_url, receive_timeout: 1_000]
+        })
+        |> Enum.to_list()
+
+      assert {:thinking_delta, 0, "thinking", _} =
+               Enum.find(events, &match?({:thinking_delta, _, _, _}, &1))
+    end)
+  end
+
+  test "malformed Responses API tool arguments become a structured stream error" do
+    sse = [
+      sse_json(%{
+        "type" => "response.output_item.added",
+        "item" => %{
+          "type" => "function_call",
+          "id" => "item_bad",
+          "call_id" => "call_bad",
+          "name" => "read",
+          "arguments" => ""
+        }
+      }),
+      sse_json(%{
+        "type" => "response.function_call_arguments.done",
+        "item_id" => "item_bad",
+        "arguments" => "{"
+      }),
+      sse_json(%{"type" => "response.completed", "response" => %{"status" => "completed"}}),
+      "data: [DONE]\n\n"
+    ]
+
+    with_sse_server(sse, fn base_url ->
+      request =
+        Sigma.Ai.ProviderRequest.from_legacy(%{
+          model: %{id: "gpt-5", api: "openai", provider: "openai"},
+          context: %{messages: [], system_prompt: nil, tools: []},
+          options: [api_key: "test-key", base_url: base_url, receive_timeout: 1_000]
+        })
+
+      events = Sigma.Ai.Provider.stream(OpenAIResponses, request) |> Enum.to_list()
+
+      assert %Sigma.Ai.ProviderEvent{
+               type: :response_failed,
+               error: %ProviderError{kind: :malformed_stream, retryable: false}
+             } = Enum.find(events, &(&1.type == :response_failed))
+
+      refute Enum.any?(events, &(&1.type == :response_completed))
+    end)
+  end
 
   test "captures prompt tokens from stream usage chunk" do
     sse = [
@@ -129,6 +300,63 @@ defmodule Sigma.Ai.Providers.OpenAITest do
 
       assert {:done, :tool_use, ai_msg} = Enum.find(events, &match?({:done, _, _}, &1))
       assert ai_msg.content == [tool_call]
+    end)
+  end
+
+  test "keeps text deltas separate when they follow streamed tool calls" do
+    sse = [
+      sse_json(%{
+        "choices" => [
+          %{
+            "index" => 0,
+            "delta" => %{
+              "tool_calls" => [
+                %{
+                  "index" => 0,
+                  "id" => "call_then_text",
+                  "type" => "function",
+                  "function" => %{"name" => "read", "arguments" => "{\"path\":\"README.md\"}"}
+                }
+              ]
+            },
+            "finish_reason" => nil
+          }
+        ]
+      }),
+      sse_json(%{
+        "choices" => [
+          %{
+            "index" => 0,
+            "delta" => %{"content" => "After the tool call"},
+            "finish_reason" => nil
+          }
+        ]
+      }),
+      sse_json(%{
+        "choices" => [
+          %{"index" => 0, "delta" => %{}, "finish_reason" => "stop"}
+        ]
+      }),
+      "data: [DONE]\n\n"
+    ]
+
+    with_sse_server(sse, fn base_url ->
+      events =
+        OpenAI.stream(%{
+          model: %{id: "gpt-test", api: "openai", provider: "openai"},
+          context: %{messages: [], system_prompt: nil, tools: []},
+          options: [api_key: "test-key", base_url: base_url, receive_timeout: 1_000]
+        })
+        |> Enum.to_list()
+
+      assert {:text_delta, 1, "After the tool call", _} =
+               Enum.find(events, &match?({:text_delta, _, _, _}, &1))
+
+      assert {:done, :tool_use,
+              %{content: [%{type: :tool_call}, %{type: :text, text: "After the tool call"}]}} =
+               Enum.find(events, &match?({:done, _, _}, &1))
+
+      refute Enum.any?(events, &match?({:provider_error, _}, &1))
     end)
   end
 

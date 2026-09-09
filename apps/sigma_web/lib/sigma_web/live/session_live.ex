@@ -2465,7 +2465,9 @@ defmodule Sigma.Web.SessionLive do
     provider_mod =
       case config["api_type"] do
         "anthropic" -> Sigma.Ai.Providers.Anthropic
-        "openai" -> Sigma.Ai.Providers.OpenAI
+        "openai" -> Sigma.Ai.Providers.OpenAIResponses
+        "openai-responses" -> Sigma.Ai.Providers.OpenAIResponses
+        "openai-completions" -> Sigma.Ai.Providers.OpenAI
         _ -> Application.get_env(:sigma_web, :mock_provider_module)
       end
 
@@ -2493,7 +2495,7 @@ defmodule Sigma.Web.SessionLive do
     ]
   end
 
-  defp default_auth_type("openai"), do: "bearer"
+  defp default_auth_type(api_type) when api_type in ["openai", "openai-responses", "openai-completions"], do: "bearer"
   defp default_auth_type(_api_type), do: "x-api-key"
 
   defp session_menu_button_id(session_id) do

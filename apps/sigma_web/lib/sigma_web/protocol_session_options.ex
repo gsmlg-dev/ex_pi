@@ -56,7 +56,9 @@ defmodule Sigma.Web.ProtocolSessionOptions do
   defp provider_config(_snapshot, _metadata), do: ConfigManager.get_active_provider_config()
 
   defp provider_module(%{"api_type" => "anthropic"}), do: {:ok, Sigma.Ai.Providers.Anthropic}
-  defp provider_module(%{"api_type" => "openai"}), do: {:ok, Sigma.Ai.Providers.OpenAI}
+  defp provider_module(%{"api_type" => "openai"}), do: {:ok, Sigma.Ai.Providers.OpenAIResponses}
+  defp provider_module(%{"api_type" => "openai-responses"}), do: {:ok, Sigma.Ai.Providers.OpenAIResponses}
+  defp provider_module(%{"api_type" => "openai-completions"}), do: {:ok, Sigma.Ai.Providers.OpenAI}
 
   defp provider_module(_config) do
     case Application.get_env(:sigma_web, :mock_provider_module) do
@@ -71,10 +73,13 @@ defmodule Sigma.Web.ProtocolSessionOptions do
     [
       api_key: config["resolved_key"] || "",
       base_url: config["base_url"] || "",
-      auth_type: config["auth_type"] || if(api_type == "openai", do: "bearer", else: "x-api-key"),
+      auth_type: config["auth_type"] || default_auth_type(api_type),
       auth_header_name: config["auth_header_name"] || ""
     ]
   end
+
+  defp default_auth_type(api_type) when api_type in ["openai", "openai-responses", "openai-completions"], do: "bearer"
+  defp default_auth_type(_api_type), do: "x-api-key"
 
   defp agent_model(config, model_id) do
     metadata =

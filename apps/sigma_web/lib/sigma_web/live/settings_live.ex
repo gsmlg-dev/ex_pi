@@ -2150,7 +2150,7 @@ defmodule Sigma.Web.SettingsLive do
   end
 
   defp provider_api_options do
-    [{"anthropic", "Anthropic"}, {"openai", "OpenAI"}]
+    [{"anthropic", "Anthropic"}, {"openai", "OpenAI Responses"}, {"openai-completions", "OpenAI Chat Completions"}]
   end
 
   defp provider_auth_type_options do
@@ -2162,7 +2162,9 @@ defmodule Sigma.Web.SettingsLive do
   end
 
   defp format_api_type("anthropic"), do: "Anthropic"
-  defp format_api_type("openai"), do: "OpenAI"
+  defp format_api_type("openai"), do: "OpenAI Responses"
+  defp format_api_type("openai-responses"), do: "OpenAI Responses"
+  defp format_api_type("openai-completions"), do: "OpenAI Chat Completions"
   defp format_api_type(value), do: blank_fallback(value, "-")
 
   defp credential_name(_credentials, id) when id in [nil, ""], do: "No Key Selected"
@@ -2245,6 +2247,8 @@ defmodule Sigma.Web.SettingsLive do
   end
 
   defp normalize_provider_api_type("openai"), do: "openai"
+  defp normalize_provider_api_type("openai-responses"), do: "openai"
+  defp normalize_provider_api_type("openai-completions"), do: "openai-completions"
   defp normalize_provider_api_type(_api_type), do: "anthropic"
 
   defp normalize_provider_form(form) do
@@ -2260,7 +2264,7 @@ defmodule Sigma.Web.SettingsLive do
     )
   end
 
-  defp default_auth_type("openai"), do: "bearer"
+  defp default_auth_type(api_type) when api_type in ["openai", "openai-responses", "openai-completions"], do: "bearer"
   defp default_auth_type(_api_type), do: "x-api-key"
 
   defp maybe_update_default_auth_type(current_form, params) do

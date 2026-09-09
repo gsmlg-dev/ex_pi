@@ -69,7 +69,8 @@ defmodule Sigma.Session.ConfigManager do
         api_type =
           case p["api"] do
             "anthropic-messages" -> "anthropic"
-            "openai-completions" -> "openai"
+            "openai-completions" -> "openai-completions"
+            "openai-responses" -> "openai"
             _ -> p["api"] || "anthropic"
           end
 
@@ -164,7 +165,7 @@ defmodule Sigma.Session.ConfigManager do
            "api" =>
              case p["api_type"] do
                "anthropic" -> "anthropic-messages"
-               "openai" -> "openai-completions"
+               "openai" -> "openai-responses"
                _ -> p["api_type"]
              end,
            "authType" => auth_type,

@@ -1,4 +1,4 @@
-defmodule Sigma.Ai.Providers.OpenAI do
+defmodule Sigma.Ai.Providers.OpenAIResponses do
   @behaviour Sigma.Ai.Provider
 
   alias Sigma.Ai.{ProviderAuth, ProviderCapabilities, ProviderError, ProviderRequest, Stream}
@@ -11,11 +11,11 @@ defmodule Sigma.Ai.Providers.OpenAI do
   def capabilities(model) do
     %ProviderCapabilities{
       tools: true,
-      thinking: false,
+      thinking: true,
       image_input: true,
       context_window: model[:context_window] || model["contextWindow"],
       max_output_tokens: model[:max_tokens] || model["maxTokens"],
-      supported_options: [:max_tokens]
+      supported_options: [:max_tokens, :reasoning_effort]
     }
   end
 
@@ -36,18 +36,18 @@ defmodule Sigma.Ai.Providers.OpenAI do
 
     body = %{
       model: model.id,
-      messages:
+      input:
         context.messages
         |> transform_messages()
         |> prepend_system_message(context[:system] || context[:system_prompt]),
       stream: true,
-      stream_options: %{include_usage: true}
+      store: false
     }
 
     body =
       case output_token_limit(model, options) do
         nil -> body
-        limit -> Map.put(body, :max_tokens, limit)
+        limit -> Map.put(body, :max_output_tokens, limit)
       end
 
     # Add tools if present
@@ -104,13 +104,13 @@ defmodule Sigma.Ai.Providers.OpenAI do
             session_id: session_id,
             log_session_id: log_session_id,
             model: model.id,
-            provider: "openai"
+            provider: "openai-responses"
           }
         )
 
         resp =
           try do
-            Req.post!(base_url <> "/chat/completions",
+            Req.post!(base_url <> "/responses",
               json: body,
               headers: headers,
               receive_timeout: options[:receive_timeout] || 120_000,
@@ -248,38 +248,57 @@ defmodule Sigma.Ai.Providers.OpenAI do
   end
 
   defp transform_messages(messages) do
-    Enum.map(messages, fn
+    Enum.flat_map(messages, fn
       %{role: :user, content: content} ->
-        %{role: "user", content: transform_user_content(content)}
+        [%{role: "user", content: transform_responses_content(content, "input_text")}]
 
       %{role: :assistant, content: content} ->
-        transform_assistant_message(content)
+        transform_assistant_responses_items(content)
 
       %{role: :tool_result, tool_call_id: id, content: content} ->
-        %{
-          role: "tool",
-          tool_call_id: id,
-          content: transform_tool_result_content(content)
-        }
+        [
+          %{
+            type: "function_call_output",
+            call_id: id,
+            output: transform_tool_result_content(content)
+          }
+        ]
     end)
   end
 
-  defp transform_user_content(content) when is_binary(content), do: content
+  defp transform_responses_content(content, _text_type) when is_binary(content),
+    do: [%{type: "input_text", text: content}]
 
-  defp transform_user_content(content) when is_list(content) do
+  defp transform_responses_content(content, text_type) when is_list(content) do
     Enum.map(content, fn
       %{type: :text, text: text} ->
-        %{type: "text", text: text}
+        %{type: text_type, text: text}
 
       %{type: :image, data: data, mime_type: mime} ->
-        %{type: "image_url", image_url: %{url: "data:#{mime};base64,#{data}"}}
+        %{type: "input_image", image_url: "data:#{mime};base64,#{data}"}
 
       block ->
         block
     end)
   end
 
-  defp transform_user_content(content), do: content
+  defp transform_responses_content(content, _text_type), do: content
+
+  defp transform_assistant_responses_items(content) when is_list(content) do
+    Enum.flat_map(content, fn
+      %{type: :text, text: text} ->
+        [%{type: "message", role: "assistant", content: [%{type: "output_text", text: text}]}]
+
+      %{type: :tool_call, id: id, name: name, arguments: arguments} ->
+        [%{type: "function_call", call_id: id, name: name, arguments: Jason.encode!(arguments)}]
+
+      _ ->
+        []
+    end)
+  end
+
+  defp transform_assistant_responses_items(content),
+    do: [%{type: "message", role: "assistant", content: [%{type: "output_text", text: content}]}]
 
   defp transform_tool_result_content(content) when is_list(content) do
     Enum.map_join(content, "\n", fn
@@ -290,70 +309,22 @@ defmodule Sigma.Ai.Providers.OpenAI do
 
   defp transform_tool_result_content(content), do: content
 
-  defp transform_assistant_message(content) when is_list(content) do
-    tool_calls = content |> Enum.filter(&tool_call_block?/1) |> Enum.map(&transform_tool_call/1)
-
-    if tool_calls == [] do
-      %{role: "assistant", content: transform_content(content)}
-    else
-      %{
-        role: "assistant",
-        content: transform_assistant_content_without_tools(content),
-        tool_calls: tool_calls
-      }
-    end
-  end
-
-  defp transform_assistant_message(content), do: %{role: "assistant", content: content}
-
-  defp transform_assistant_content_without_tools(content) do
-    case Enum.reject(content, &tool_call_block?/1) do
-      [] -> nil
-      blocks -> transform_content(blocks)
-    end
-  end
-
-  defp transform_content(content) do
-    Enum.map(content, fn
-      %{type: :text, text: text} ->
-        %{type: "text", text: text}
-
-      %{type: :thinking, thinking: thinking} ->
-        %{type: "thinking", thinking: thinking}
-
-      %{type: :tool_call} = tc ->
-        transform_tool_call(tc)
-    end)
-  end
-
-  defp tool_call_block?(%{type: :tool_call, arguments: args}) when is_map(args), do: true
-  defp tool_call_block?(_block), do: false
-
-  defp transform_tool_call(tc) do
-    %{
-      id: tc.id,
-      type: "function",
-      function: %{name: tc.name, arguments: Jason.encode!(tc.arguments)}
-    }
-  end
-
   defp transform_tools(tools) do
     Enum.map(tools, fn tool ->
       %{
         type: "function",
-        function: %{
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.parameters
-        }
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+        strict: false
       }
     end)
   end
 
-  defp prepend_system_message(messages, system) do
+  defp prepend_system_message(items, system) do
     case system_text(system) do
-      nil -> messages
-      text -> [%{role: "system", content: text} | messages]
+      nil -> items
+      text -> [%{role: "system", content: [%{type: "input_text", text: text}]} | items]
     end
   end
 
@@ -374,11 +345,10 @@ defmodule Sigma.Ai.Providers.OpenAI do
 
   defp system_block_text(text) when is_binary(text), do: text
 
-  defp system_block_text(block) when is_map(block) do
-    Map.get(block, :text) || Map.get(block, "text") || ""
-  end
+  defp system_block_text(block) when is_map(block),
+    do: Map.get(block, :text) || Map.get(block, "text") || ""
 
-  defp system_block_text(_block), do: ""
+  defp system_block_text(_), do: ""
 
   defp output_token_limit(model, options) do
     positive_integer(options[:max_tokens]) ||
@@ -416,50 +386,54 @@ defmodule Sigma.Ai.Providers.OpenAI do
   defp process_events(events, message) do
     Enum.map_reduce(events, message, fn event, acc ->
       case event do
-        %{"error" => error} ->
+        %{"type" => "response.created", "response" => response} ->
+          {[], %{acc | response_id: response["id"]}}
+
+        %{"type" => "response.output_text.delta", "delta" => text} ->
+          process_text_delta(acc, text)
+
+        %{"type" => "response.reasoning_text.delta", "delta" => text} ->
+          process_thinking_delta(acc, text)
+
+        %{"type" => "response.reasoning_summary_text.delta", "delta" => text} ->
+          process_thinking_delta(acc, text)
+
+        %{"type" => "response.output_item.added", "item" => %{"type" => "function_call"} = item} ->
+          start_response_tool(acc, item)
+
+        %{
+          "type" => "response.function_call_arguments.delta",
+          "item_id" => item_id,
+          "delta" => delta
+        } ->
+          process_response_tool_delta(acc, item_id, delta)
+
+        %{
+          "type" => "response.function_call_arguments.done",
+          "item_id" => item_id,
+          "arguments" => arguments
+        } ->
+          update_response_tool_arguments(acc, item_id, arguments)
+
+        %{"type" => "response.output_item.done", "item" => %{"type" => "function_call"} = item} ->
+          finalize_response_tool(acc, item)
+
+        %{"type" => "response.completed", "response" => response} ->
+          {tool_events, acc} = finalize_response_tools(acc)
+
+          acc = %{
+            acc
+            | usage: response_usage(response["usage"]),
+              stop_reason: response_stop_reason(response, acc)
+          }
+
+          {tool_events ++ [{:done, acc.stop_reason, acc}], acc}
+
+        %{"type" => "response.failed", "response" => response} ->
+          raise provider_error_message(response["error"] || response)
+
+        %{"type" => "error"} = error ->
           raise provider_error_message(error)
-
-        :done ->
-          {tool_call_events, acc} = finalize_pending_tool_call_events(acc)
-          stop_reason = if tool_call_events == [], do: acc.stop_reason || :stop, else: :tool_use
-          acc = %{acc | stop_reason: stop_reason}
-
-          {tool_call_events ++ [{:done, stop_reason, acc}], acc}
-
-        %{"choices" => choices} when choices != [] ->
-          choice = Enum.at(choices, 0)
-          delta = choice["delta"]
-          finish_reason = choice["finish_reason"]
-
-          acc =
-            if finish_reason,
-              do: %{acc | stop_reason: transform_stop_reason(finish_reason)},
-              else: acc
-
-          {text_events, acc} =
-            if is_binary(delta["content"]) do
-              process_text_delta(acc, delta["content"])
-            else
-              {[], acc}
-            end
-
-          {tool_events, acc} =
-            if is_list(delta["tool_calls"]) do
-              process_tool_call_deltas(acc, delta["tool_calls"])
-            else
-              {[], acc}
-            end
-
-          events = text_events ++ tool_events
-
-          case finish_reason do
-            "tool_calls" -> append_final_tool_call_events(events, acc)
-            _ -> {events, acc}
-          end
-
-        %{"usage" => usage} ->
-          new_acc = %{acc | usage: transform_usage(usage)}
-          {[], new_acc}
 
         _ ->
           {[], acc}
@@ -467,6 +441,179 @@ defmodule Sigma.Ai.Providers.OpenAI do
     end)
     |> then(fn {events, acc} -> {List.flatten(events), acc} end)
   end
+
+  defp process_thinking_delta(acc, text) do
+    index = Enum.find_index(acc.content, &(&1[:type] == :thinking)) || length(acc.content)
+
+    content =
+      if index == length(acc.content),
+        do: acc.content ++ [%{type: :thinking, thinking: ""}],
+        else: acc.content
+
+    content =
+      update_content(content, index, fn block ->
+        Map.update(block, :thinking, text, &(&1 <> text))
+      end)
+
+    msg = %{acc | content: content}
+    {[{:thinking_delta, index, text, msg}], msg}
+  end
+
+  defp start_response_tool(acc, item) do
+    item_id = item["id"]
+    call_id = item["call_id"]
+
+    case response_tool_index(acc.content, item_id, call_id) do
+      nil ->
+        index = length(acc.content)
+
+        block = %{
+          type: :tool_call,
+          item_id: item_id,
+          id: call_id,
+          name: item["name"],
+          partial_json: item["arguments"] || ""
+        }
+
+        new_acc = %{acc | content: acc.content ++ [block]}
+        {[{:toolcall_start, index, new_acc}], new_acc}
+
+      _index ->
+        {[], acc}
+    end
+  end
+
+  defp process_response_tool_delta(acc, item_id, delta) do
+    index = response_tool_index(acc.content, item_id, nil) || length(acc.content)
+
+    content =
+      if index == length(acc.content),
+        do:
+          acc.content ++
+            [%{type: :tool_call, item_id: item_id, id: nil, name: nil, partial_json: ""}],
+        else: acc.content
+
+    content =
+      update_content(content, index, fn block ->
+        Map.update(block, :partial_json, delta, &(&1 <> delta))
+      end)
+
+    msg = %{acc | content: content}
+    {[{:toolcall_delta, index, delta, msg}], msg}
+  end
+
+  defp update_response_tool_arguments(acc, item_id, arguments) do
+    index = response_tool_index(acc.content, item_id, nil) || length(acc.content)
+
+    content =
+      if index == length(acc.content),
+        do:
+          acc.content ++
+            [%{type: :tool_call, item_id: item_id, id: nil, name: nil, partial_json: ""}],
+        else: acc.content
+
+    content =
+      List.replace_at(content, index, Map.put(Enum.at(content, index), :arguments, arguments))
+
+    {[], %{acc | content: content}}
+  end
+
+  defp finalize_response_tool(acc, item) do
+    item_id = item["id"]
+    call_id = item["call_id"]
+    index = response_tool_index(acc.content, item_id, call_id) || length(acc.content)
+    block = Enum.at(acc.content, index) || %{}
+    arguments = item["arguments"] || block[:arguments] || block[:partial_json]
+    name = item["name"] || block[:name]
+    call_id = call_id || block[:id] || item_id
+
+    with {:ok, arguments} <- decode_arguments(arguments),
+         true <- is_binary(call_id) and call_id != "",
+         true <- is_binary(name) and name != "" do
+      call = %{type: :tool_call, id: call_id, name: name, arguments: arguments}
+
+      content =
+        if index == length(acc.content),
+          do: acc.content ++ [call],
+          else: List.replace_at(acc.content, index, call)
+
+      msg = %{acc | content: content}
+      {[{:toolcall_end, index, call, msg}], msg}
+    else
+      _ -> {[{:provider_error, ProviderError.malformed(:invalid_tool_call_arguments)}], acc}
+    end
+  end
+
+  defp finalize_response_tools(acc) do
+    acc.content
+    |> Enum.reduce({[], acc}, fn block, {events, current_acc} ->
+      if block[:type] == :tool_call and Map.has_key?(block, :partial_json) do
+        {new_events, new_acc} =
+          finalize_response_tool(current_acc, %{
+            "id" => block[:item_id],
+            "call_id" => block[:id],
+            "name" => block[:name],
+            "arguments" => block[:arguments] || block[:partial_json]
+          })
+
+        {events ++ new_events, new_acc}
+      else
+        {events, current_acc}
+      end
+    end)
+  end
+
+  defp response_tool_index(content, item_id, call_id) do
+    Enum.find_index(content, fn block ->
+      block[:type] == :tool_call and
+        ((is_binary(item_id) and block[:item_id] == item_id) or
+           (is_binary(call_id) and block[:id] == call_id))
+    end)
+  end
+
+  defp decode_arguments(arguments) when is_map(arguments), do: {:ok, arguments}
+
+  defp decode_arguments(arguments) when is_binary(arguments) do
+    case Jason.decode(arguments) do
+      {:ok, value} when is_map(value) -> {:ok, value}
+      _ -> :error
+    end
+  end
+
+  defp decode_arguments(_), do: :error
+
+  defp response_usage(nil), do: acc_usage_empty()
+
+  defp response_usage(usage) do
+    input = usage["input_tokens"] || 0
+    output = usage["output_tokens"] || 0
+    cached = get_in(usage, ["input_token_details", "cached_tokens"]) || 0
+
+    %{
+      input: input - cached,
+      output: output,
+      cache_read: cached,
+      cache_write: 0,
+      total_tokens: input + output,
+      cost: %{input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0, total: 0.0}
+    }
+  end
+
+  defp acc_usage_empty,
+    do: %{
+      input: 0,
+      output: 0,
+      cache_read: 0,
+      cache_write: 0,
+      total_tokens: 0,
+      cost: %{input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0, total: 0.0}
+    }
+
+  defp response_stop_reason(%{"status" => "incomplete"}, _), do: :length
+  defp response_stop_reason(%{"status" => "failed"}, _), do: :error
+
+  defp response_stop_reason(_response, acc),
+    do: if(Enum.any?(acc.content, &(&1[:type] == :tool_call)), do: :tool_use, else: :stop)
 
   defp update_content(content, idx, fun) do
     List.replace_at(content, idx, fun.(Enum.at(content, idx)))
@@ -499,128 +646,6 @@ defmodule Sigma.Ai.Providers.OpenAI do
 
   defp text_content_index(content) do
     Enum.find_index(content, &match?(%{type: :text}, &1))
-  end
-
-  defp process_tool_call_deltas(acc, tool_call_deltas) do
-    Enum.map_reduce(tool_call_deltas, acc, &process_tool_call_delta/2)
-    |> then(fn {events, acc} -> {List.flatten(events), acc} end)
-  end
-
-  defp process_tool_call_delta(delta, acc) do
-    provider_index = delta["index"] || 0
-    function = delta["function"] || %{}
-
-    {index, acc, start_event} = ensure_tool_call_block(acc, provider_index, delta, function)
-
-    new_content =
-      update_content(acc.content, index, fn block ->
-        block
-        |> maybe_put_present(:id, delta["id"])
-        |> maybe_put_present(:name, function["name"])
-        |> Map.update(
-          :partial_json,
-          function["arguments"] || "",
-          &(&1 <> (function["arguments"] || ""))
-        )
-      end)
-
-    new_acc = %{acc | content: new_content}
-
-    delta_event =
-      case function["arguments"] do
-        arguments when is_binary(arguments) -> {:toolcall_delta, index, arguments, new_acc}
-        _ -> nil
-      end
-
-    {[start_event, delta_event] |> Enum.reject(&is_nil/1), new_acc}
-  end
-
-  defp ensure_tool_call_block(acc, provider_index, delta, function) do
-    case tool_call_content_index(acc.content, provider_index) do
-      nil ->
-        index = length(acc.content)
-
-        block = %{
-          type: :tool_call,
-          id: delta["id"],
-          name: function["name"],
-          partial_json: "",
-          provider_index: provider_index
-        }
-
-        new_content = acc.content ++ [block]
-        new_acc = %{acc | content: new_content}
-        {index, new_acc, {:toolcall_start, index, new_acc}}
-
-      index ->
-        {index, acc, nil}
-    end
-  end
-
-  defp tool_call_content_index(content, provider_index) do
-    Enum.find_index(content, fn
-      %{type: :tool_call, provider_index: ^provider_index} -> true
-      _ -> false
-    end)
-  end
-
-  defp append_final_tool_call_events(events, acc) do
-    {end_events, acc} = finalize_pending_tool_call_events(acc)
-    {events ++ end_events, acc}
-  end
-
-  defp finalize_pending_tool_call_events(acc) do
-    acc.content
-    |> Enum.with_index()
-    |> Enum.map_reduce(acc, fn {block, index}, current_acc ->
-      finalize_tool_call_block(current_acc, block, index)
-    end)
-    |> then(fn {events, acc} -> {Enum.reject(events, &is_nil/1), acc} end)
-  end
-
-  defp finalize_tool_call_block(
-         acc,
-         %{type: :tool_call, partial_json: partial_json} = block,
-         index
-       ) do
-    case Jason.decode(partial_json || "") do
-      {:ok, args} when is_map(args) ->
-        tool_call = %{
-          type: :tool_call,
-          id: block.id,
-          name: block.name,
-          arguments: args
-        }
-
-        new_content = List.replace_at(acc.content, index, tool_call)
-        new_acc = %{acc | content: new_content}
-        {{:toolcall_end, index, tool_call, new_acc}, new_acc}
-
-      _invalid ->
-        {{:provider_error, ProviderError.malformed(:invalid_tool_call_arguments)}, acc}
-    end
-  end
-
-  defp finalize_tool_call_block(acc, _block, _index), do: {nil, acc}
-
-  defp maybe_put_present(map, _key, nil), do: map
-  defp maybe_put_present(map, _key, ""), do: map
-  defp maybe_put_present(map, key, value), do: Map.put(map, key, value)
-
-  defp transform_stop_reason("stop"), do: :stop
-  defp transform_stop_reason("length"), do: :length
-  defp transform_stop_reason("tool_calls"), do: :tool_use
-  defp transform_stop_reason(_), do: nil
-
-  defp transform_usage(usage) do
-    %{
-      input: usage["prompt_tokens"] || 0,
-      output: usage["completion_tokens"] || 0,
-      cache_read: 0,
-      cache_write: 0,
-      total_tokens: usage["total_tokens"] || 0,
-      cost: %{input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0, total: 0.0}
-    }
   end
 
   defp provider_error_message(error) when is_map(error) do
