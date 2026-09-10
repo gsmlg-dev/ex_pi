@@ -497,6 +497,7 @@ defmodule Sigma.Session.Log do
   end
 
   defp mutation_blocking_diagnostic?(%{kind: :invalid_payload}), do: false
+  defp mutation_blocking_diagnostic?(%{kind: :message_repair}), do: false
   defp mutation_blocking_diagnostic?(_diagnostic), do: true
 
   @doc """
@@ -893,6 +894,7 @@ defmodule Sigma.Session.Log do
       Enum.reject(diagnostics, fn
         %{kind: :invalid_payload} -> true
         %{kind: :invalid_header, reason: :missing_header} -> true
+        %{kind: :message_repair} -> true
         _diagnostic -> false
       end)
 

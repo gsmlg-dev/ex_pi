@@ -202,6 +202,7 @@ defmodule Sigma.Session.Writer do
     Enum.reject(diagnostics, fn
       %{kind: :invalid_payload} -> true
       %{kind: :invalid_header, reason: :missing_header} -> true
+      %{kind: :message_repair} -> true
       _diagnostic -> false
     end)
   end

@@ -371,6 +371,27 @@ defmodule Sigma.Session.LogTest do
   end
 
   @tag :tmp_dir
+  test "appends a model change after replay repairs an orphaned tool call", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "repaired-model-change.jsonl")
+    assert :ok = Log.persist_event(path, {:agent_start, "/tmp"})
+
+    assistant = %Message{
+      id: "assistant",
+      role: :assistant,
+      content: [%{type: :tool_call, id: "orphan", name: "bash", arguments: %{}}],
+      timestamp: 1
+    }
+
+    assert :ok = Log.persist_event(path, {:message_end, assistant})
+    assert {:ok, entry_id} = Log.append_model_change(path, "anthropic", "opus")
+    assert {:ok, snapshot} = Log.snapshot(path)
+    assert snapshot.active_leaf_id == entry_id
+
+    assert [%{kind: :message_repair, reason: {:orphaned_tool_call, "orphan"}}] =
+             snapshot.diagnostics
+  end
+
+  @tag :tmp_dir
   test "refuses a model change after interior invalid JSON", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "interior-invalid-json.jsonl")
     assert :ok = Log.persist_event(path, {:agent_start, "/tmp"})

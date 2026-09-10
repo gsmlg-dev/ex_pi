@@ -9,7 +9,8 @@ defmodule Sigma.Session.WriterTest do
     @behaviour Sigma.Session.Storage
 
     @impl true
-    def read(storage), do: read_with_diagnostics(storage) |> then(fn {:ok, entries, _} -> {:ok, entries} end)
+    def read(storage),
+      do: read_with_diagnostics(storage) |> then(fn {:ok, entries, _} -> {:ok, entries} end)
 
     @impl true
     def read_with_diagnostics(storage) do
@@ -123,6 +124,42 @@ defmodule Sigma.Session.WriterTest do
     assert get_in(successful, ["message", "id"]) == "saved"
   end
 
+  test "continues appending after replay repairs an orphaned tool call" do
+    storage =
+      start_storage(%{
+        entries: [
+          header(),
+          %{
+            "type" => "message",
+            "id" => "assistant-entry",
+            "parentId" => nil,
+            "timestamp" => "2026-09-01T00:00:01Z",
+            "message" => %{
+              "id" => "assistant-message",
+              "role" => "assistant",
+              "content" => [
+                %{"type" => "tool_call", "id" => "orphan", "name" => "bash", "arguments" => %{}}
+              ],
+              "timestamp" => 1
+            }
+          }
+        ]
+      })
+
+    {:ok, writer} =
+      Writer.start_link(
+        storage_id: storage,
+        storage_mod: RecordingStorage,
+        session_id: "session-1",
+        cwd: "/repo"
+      )
+
+    assert {:ok, entry_id} = Writer.append(writer, {:message_end, Message.user("m1", "continue")})
+    assert %{entries: [_header, _orphan, appended]} = Agent.get(storage, & &1)
+    assert appended["id"] == entry_id
+    assert appended["parentId"] == "assistant-entry"
+  end
+
   @tag :tmp_dir
   test "reconstructs the active leaf after a writer restart", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "restart.jsonl")
@@ -156,7 +193,9 @@ defmodule Sigma.Session.WriterTest do
     first = Task.async(fn -> Writer.append(writer, {:message_end, Message.user("m1", "one")}) end)
     assert_receive {:append_requested, ^writer, first_entry}
 
-    second = Task.async(fn -> Writer.append(writer, {:message_end, Message.user("m2", "two")}) end)
+    second =
+      Task.async(fn -> Writer.append(writer, {:message_end, Message.user("m2", "two")}) end)
+
     refute_receive {:append_requested, ^writer, _entry}, 50
 
     send(writer, {:append_result, :ok})
