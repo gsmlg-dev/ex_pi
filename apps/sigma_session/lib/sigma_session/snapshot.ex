@@ -51,6 +51,7 @@ defmodule Sigma.Session.Snapshot do
     :mode_data,
     :compaction,
     :branch_summary,
+    :metrics,
     branch_entry_ids: [],
     message_entry_ids: %{},
     messages: [],
@@ -79,6 +80,7 @@ defmodule Sigma.Session.Snapshot do
           mode_data: map() | nil,
           compaction: map() | nil,
           branch_summary: map() | nil,
+          metrics: Sigma.Session.Metrics.t(),
           diagnostics: [diagnostic()]
         }
 end

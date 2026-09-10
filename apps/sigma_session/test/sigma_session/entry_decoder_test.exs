@@ -112,6 +112,43 @@ defmodule Sigma.Session.EntryDecoderTest do
             }} = EntryDecoder.compaction(entry)
   end
 
+  test "rejects unknown metrics facts without creating atoms" do
+    unknown = "future_metrics_fact_#{System.unique_integer([:positive])}"
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown) end
+
+    assert {:error, :invalid_metrics} =
+             EntryDecoder.metrics(%{"type" => "metrics", "fact" => unknown, "data" => %{}})
+
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown) end
+  end
+
+  test "decodes closed turn lifecycle facts without converting data keys to atoms" do
+    unknown_key = "future_turn_field_#{System.unique_integer([:positive])}"
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_key) end
+
+    entry = %{
+      "type" => "metrics",
+      "fact" => "turn_finished",
+      "data" => %{
+        "turn_id" => "turn-1",
+        "status" => "completed",
+        "purpose" => "auxiliary",
+        unknown_key => "retained"
+      }
+    }
+
+    assert {:ok,
+            {:turn_finished,
+             %{
+               "turn_id" => "turn-1",
+               "status" => :completed,
+               "purpose" => :auxiliary,
+               ^unknown_key => "retained"
+             }}} = EntryDecoder.metrics(entry)
+
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_key) end
+  end
+
   test "allows an explicitly nil status type" do
     entry =
       message_entry(%{

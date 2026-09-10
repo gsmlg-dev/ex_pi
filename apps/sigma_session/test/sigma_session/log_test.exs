@@ -72,6 +72,126 @@ defmodule Sigma.Session.LogTest do
   end
 
   @tag :tmp_dir
+  test "resolves a retry checkpoint without appending or moving the active leaf", %{
+    tmp_dir: tmp_dir
+  } do
+    path = Path.join(tmp_dir, "retry-checkpoint.jsonl")
+
+    user = %{
+      Message.user("user-1", [%{type: :text, text: "Retry this"}])
+      | attachments: [%{"name" => "context.txt", "size" => 12}],
+        metadata: %{turn_id: "turn-original"}
+    }
+
+    assistant = Message.assistant("assistant-1", %{content: "old answer"})
+
+    assert :ok = Log.persist_event(path, {:agent_start, "/tmp"})
+    assert :ok = Log.persist_event(path, {:message_end, user})
+    assert :ok = Log.persist_event(path, {:message_end, assistant})
+    assert {:ok, before} = Log.snapshot(path)
+    before_bytes = File.read!(path)
+    assert {:ok, checkpoint} = Log.retry_checkpoint(path, "user-1")
+    assert checkpoint.message_id == "user-1"
+    assert checkpoint.retry_of_turn_id == "turn-original"
+    assert checkpoint.content == [%{type: :text, text: "Retry this"}]
+    assert checkpoint.attachments == [%{"name" => "context.txt", "size" => 12}]
+    assert checkpoint.message.content == checkpoint.content
+    assert checkpoint.message.attachments == checkpoint.attachments
+    assert checkpoint.source_entry_id in before.branch_entry_ids
+    assert checkpoint.checkpoint_entry_id in [nil | before.branch_entry_ids]
+    assert checkpoint.source_leaf_id == before.active_leaf_id
+    assert checkpoint.branch_entry_ids == Enum.take(before.branch_entry_ids, 1)
+    assert {:ok, after_snapshot} = Log.snapshot(path)
+    assert after_snapshot.active_leaf_id == before.active_leaf_id
+    assert File.read!(path) == before_bytes
+  end
+
+  @tag :tmp_dir
+  test "rejects a non-user retry target", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "retry-invalid.jsonl")
+    assert :ok = Log.persist_event(path, {:agent_start, "/tmp"})
+
+    assert :ok =
+             Log.persist_event(path, {:message_end, Message.assistant("a", %{content: "answer"})})
+
+    assert {:error, :not_retryable} = Log.retry_checkpoint(path, "a")
+  end
+
+  @tag :tmp_dir
+  test "round trips metrics facts without changing the conversation leaf", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "metrics.jsonl")
+
+    assert :ok = Log.persist_event(path, {:agent_start, "/tmp"})
+    assert :ok = Log.persist_event(path, {:message_end, Message.user("user-1", "Hello")})
+    assert {:ok, _model_entry_id} = Log.append_model_change(path, "anthropic", "opus")
+
+    assert :ok =
+             Log.persist_event(
+               path,
+               {:metrics, :request_finished,
+                %{
+                  request_id: "req-1",
+                  session_id: "session-1",
+                  revision: 1,
+                  status: :completed,
+                  input_tokens_total: 10,
+                  output_tokens_total: 20,
+                  elapsed_ms: 1_000
+                }}
+             )
+
+    assert :ok =
+             Log.persist_event(
+               path,
+               {:metrics, :tool_finished,
+                %{tool_id: "tool-1", turn_id: "turn-1", status: :completed, elapsed_ms: 10}}
+             )
+
+    assert {:ok, entries} = Sigma.Session.Storage.JsonlFile.read(path)
+    model_entry = Enum.find(entries, &(&1["type"] == "model_change"))
+    assert {:ok, snapshot} = Log.snapshot(path)
+    assert snapshot.active_leaf_id == model_entry["id"]
+    assert snapshot.provider_id == "anthropic"
+    assert snapshot.model_id == "opus"
+    assert %{requests: %{"req-1" => request}} = snapshot.metrics
+    assert request.output_tokens_total == 20
+    assert [%{tool_id: "tool-1"}] = snapshot.metrics.tools |> Map.values()
+    assert snapshot.metrics.facts == 2
+    assert snapshot.messages |> Enum.map(& &1.id) == ["user-1"]
+  end
+
+  @tag :tmp_dir
+  test "round trips operation completion records without changing the conversation leaf", %{
+    tmp_dir: tmp_dir
+  } do
+    path = Path.join(tmp_dir, "operation.jsonl")
+
+    assert :ok = Log.persist_event(path, {:agent_start, "/tmp"})
+    assert :ok = Log.persist_event(path, {:message_end, Message.user("user-1", "Hello")})
+    {:ok, before} = Log.snapshot(path)
+
+    assert :ok =
+             Log.persist_event(path, {
+               :operation_finished,
+               %{
+                 operation_id: "op-1",
+                 operation: :fork,
+                 source_session_id: "session-1",
+                 status: :completed,
+                 result: %{session_id: "target-1"}
+               }
+             })
+
+    assert {:ok,
+            [%{operation_id: "op-1", status: :completed, result: %{"session_id" => "target-1"}}]} =
+             Log.operation_results(path)
+
+    assert {:ok, after_snapshot} = Log.snapshot(path)
+    assert after_snapshot.active_leaf_id == before.active_leaf_id
+    assert after_snapshot.messages |> Enum.map(& &1.id) == ["user-1"]
+  end
+
+  @tag :tmp_dir
   test "persists and replays rich text and image content", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "rich-content.jsonl")
 
@@ -407,6 +527,149 @@ defmodule Sigma.Session.LogTest do
   end
 
   @tag :tmp_dir
+  test "lists bounded retry branch summaries without treating metrics siblings as leaves", %{
+    tmp_dir: tmp_dir
+  } do
+    path = Path.join(tmp_dir, "branch-summaries.jsonl")
+
+    entries = [
+      %{
+        "type" => "session",
+        "version" => 3,
+        "id" => "session",
+        "timestamp" => "2026-09-09T00:00:00Z",
+        "cwd" => "/repo"
+      },
+      message_entry("root", nil, "user-root", "user", "Try this", %{
+        "turn_id" => "turn-original"
+      }),
+      message_entry(
+        "original-answer",
+        "root",
+        "assistant-original",
+        "assistant",
+        "Original answer that is longer than the summary limit",
+        %{"turn_id" => "turn-original"}
+      ),
+      %{
+        "type" => "metrics",
+        "fact" => "request_started",
+        "id" => "metrics-sibling",
+        "parentId" => "original-answer",
+        "timestamp" => "2026-09-09T00:00:03Z",
+        "data" => %{"request_id" => "request-original", "status" => "running"}
+      },
+      message_entry(
+        "retry-user",
+        "root",
+        "user-retry",
+        "user",
+        [
+          %{"type" => "image", "data" => "private-image-data", "mime_type" => "image/png"},
+          %{"type" => "text", "text" => "Retry with a safer answer"}
+        ],
+        %{"turn_id" => "turn-retry", "retry_of_turn_id" => "turn-original"}
+      ),
+      message_entry(
+        "retry-answer",
+        "retry-user",
+        "assistant-retry",
+        "assistant",
+        [%{"type" => "text", "text" => "Replacement answer"}],
+        %{"turn_id" => "turn-retry", "retry_of_turn_id" => "turn-original"}
+      )
+    ]
+
+    Enum.each(entries, &Sigma.Session.Storage.JsonlFile.append(path, &1))
+    before_bytes = File.read!(path)
+
+    assert {:ok, summaries} = Log.branch_summaries(path, summary_length: 12)
+
+    assert [
+             %{
+               leaf_id: "retry-answer",
+               active?: true,
+               parent_leaf_id: "retry-user",
+               branch_point_id: "root",
+               turn_id: "turn-retry",
+               retry_of_turn_id: "turn-original",
+               last_user: %{message_id: "user-retry", text: retry_text},
+               last_assistant: %{
+                 message_id: "assistant-retry",
+                 text: replacement_text
+               }
+             },
+             %{
+               leaf_id: "original-answer",
+               active?: false,
+               parent_leaf_id: "root",
+               branch_point_id: "root",
+               turn_id: "turn-original",
+               retry_of_turn_id: nil,
+               last_user: %{message_id: "user-root", text: "Try this"},
+               last_assistant: %{
+                 message_id: "assistant-original",
+                 text: original_text
+               }
+             }
+           ] = summaries
+
+    assert retry_text == "Retry with a"
+    assert replacement_text == "Replacement "
+    assert original_text == "Original ans"
+    refute inspect(summaries) =~ "private-image-data"
+    assert File.read!(path) == before_bytes
+  end
+
+  @tag :tmp_dir
+  test "branch summaries tolerate legacy metadata and invalid message payloads", %{
+    tmp_dir: tmp_dir
+  } do
+    path = Path.join(tmp_dir, "legacy-branch-summaries.jsonl")
+
+    entries = [
+      %{
+        "type" => "session",
+        "version" => 3,
+        "id" => "session",
+        "timestamp" => "2026-09-09T00:00:00Z",
+        "cwd" => "/repo"
+      },
+      message_entry("root", nil, "legacy-user", "user", "Legacy prompt"),
+      message_entry("valid-leaf", "root", "legacy-assistant", "assistant", nil),
+      %{
+        "type" => "message",
+        "id" => "invalid-leaf",
+        "parentId" => "root",
+        "timestamp" => "2026-09-09T00:00:03Z",
+        "message" => %{"role" => "assistant"}
+      }
+    ]
+
+    Enum.each(entries, &Sigma.Session.Storage.JsonlFile.append(path, &1))
+
+    assert {:ok,
+            [
+              %{
+                leaf_id: "invalid-leaf",
+                active?: true,
+                turn_id: nil,
+                retry_of_turn_id: nil,
+                last_user: %{message_id: "legacy-user", text: "Legacy prompt"},
+                last_assistant: nil
+              },
+              %{
+                leaf_id: "valid-leaf",
+                active?: false,
+                turn_id: nil,
+                retry_of_turn_id: nil,
+                last_user: %{message_id: "legacy-user", text: "Legacy prompt"},
+                last_assistant: %{message_id: "legacy-assistant", text: nil}
+              }
+            ]} = Log.branch_summaries(path)
+  end
+
+  @tag :tmp_dir
   test "snapshot includes storage diagnostics while replay remains tolerant", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "torn.jsonl")
 
@@ -436,5 +699,24 @@ defmodule Sigma.Session.LogTest do
            ]
 
     assert {:ok, []} = Log.replay(path)
+  end
+
+  defp message_entry(id, parent_id, message_id, role, content, metadata \\ nil) do
+    message = %{
+      "id" => message_id,
+      "role" => role,
+      "content" => content,
+      "timestamp" => 1
+    }
+
+    message = if is_map(metadata), do: Map.put(message, "metadata", metadata), else: message
+
+    %{
+      "type" => "message",
+      "id" => id,
+      "parentId" => parent_id,
+      "timestamp" => "2026-09-09T00:00:01Z",
+      "message" => message
+    }
   end
 end

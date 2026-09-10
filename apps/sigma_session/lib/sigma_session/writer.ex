@@ -46,6 +46,11 @@ defmodule Sigma.Session.Writer do
     GenServer.call(writer, :flush, :infinity)
   end
 
+  @doc "Checks out a persisted branch boundary without rewriting journal history."
+  def checkout(writer, checkpoint_entry_id, expected_leaf_id) do
+    GenServer.call(writer, {:checkout, checkpoint_entry_id, expected_leaf_id}, :infinity)
+  end
+
   @impl true
   def init(opts) do
     storage_id = Keyword.fetch!(opts, :storage_id)
@@ -80,6 +85,29 @@ defmodule Sigma.Session.Writer do
         sequence: state.sequence,
         last_append_result: state.last_append_result
       }}, state}
+  end
+
+  def handle_call({:checkout, checkpoint_entry_id, expected_leaf_id}, _from, state) do
+    cond do
+      state.active_leaf_id != expected_leaf_id ->
+        {:reply,
+         {:error, {:leaf_conflict, %{expected: expected_leaf_id, actual: state.active_leaf_id}}},
+         state}
+
+      true ->
+        case Log.snapshot(state.storage_id, [leaf_id: checkpoint_entry_id], state.storage_mod) do
+          {:ok, snapshot} ->
+            {:reply, :ok,
+             %{
+               state
+               | active_leaf_id: checkpoint_entry_id,
+                 message_entry_ids: snapshot.message_entry_ids
+             }}
+
+          {:error, reason} ->
+            {:reply, {:error, {:invalid_retry_checkpoint, reason}}, state}
+        end
+    end
   end
 
   def handle_call({:append, event}, _from, state) do
@@ -144,7 +172,7 @@ defmodule Sigma.Session.Writer do
         state = %{
           state
           | active_leaf_id:
-              if(entry_type == :session, do: state.active_leaf_id, else: entry_id),
+              if(entry_type in [:session, :metrics], do: state.active_leaf_id, else: entry_id),
             header?: state.header? or entry_type == :session,
             sequence: state.sequence + 1,
             message_entry_ids: put_message_entry_id(state.message_entry_ids, entry),
@@ -205,5 +233,6 @@ defmodule Sigma.Session.Writer do
   defp entry_type("mode_change"), do: :mode_change
   defp entry_type("branch_summary"), do: :branch_summary
   defp entry_type("skill_invocation"), do: :skill_invocation
+  defp entry_type("metrics"), do: :metrics
   defp entry_type(_type), do: :unknown
 end

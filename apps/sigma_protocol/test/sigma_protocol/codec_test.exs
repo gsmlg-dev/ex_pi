@@ -44,8 +44,24 @@ defmodule Sigma.Protocol.CodecTest do
 
     assert {:error, {:unsupported_version, 999}} = Codec.decode(unknown_version)
 
-    unknown_type = String.replace(unknown_version, "999", "1") |> String.replace("prompt.submit", "future.command")
-    assert {:error, {:unknown_type, "future.command"}} = Codec.decode(unknown_type)
+    unknown_name = "future.command.#{System.unique_integer([:positive])}"
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_name) end
+
+    unknown_type =
+      unknown_version
+      |> String.replace("999", "1")
+      |> String.replace("prompt.submit", unknown_name)
+
+    assert {:error, {:unknown_type, ^unknown_name}} = Codec.decode(unknown_type)
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_name) end
+  end
+
+  test "publishes the closed protocol capability set" do
+    assert Envelope.capabilities() == [
+             "metrics.v1",
+             "subscription.cursor.v1",
+             "subscription.resync.v1"
+           ]
   end
 
   test "refuses internal process terms and oversized event payloads" do

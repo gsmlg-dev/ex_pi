@@ -385,7 +385,9 @@ defmodule Sigma.Session.SessionFiles do
     with :ok <- File.cp(source_jsonl_path, temp_jsonl_path),
          {:ok, temp_meta_path} <- unused_temp_path(target_meta_path) do
       case File.write(temp_meta_path, metadata_content) do
-        :ok -> {:ok, temp_meta_path}
+        :ok ->
+          {:ok, temp_meta_path}
+
         {:error, _reason} = error ->
           rm_optional(temp_meta_path)
           error
@@ -542,25 +544,45 @@ defmodule Sigma.Session.SessionFiles do
     end
   end
 
-  defp write_fork_metadata(%{exists?: false}, target_meta_path, _opts) do
-    with :ok <- run_operation_hook(:before_meta_publish, %{target: target_meta_path}) do
-      ensure_absent(target_meta_path)
+  defp write_fork_metadata(%{exists?: false}, target_meta_path, opts) do
+    case fork_metadata_updates(opts) do
+      updates when map_size(updates) == 0 ->
+        with :ok <- run_operation_hook(:before_meta_publish, %{target: target_meta_path}) do
+          ensure_absent(target_meta_path)
+        end
+
+      updates ->
+        write_file_no_overwrite(
+          target_meta_path,
+          Jason.encode!(updates, pretty: true),
+          :before_meta_publish
+        )
     end
   end
 
   defp write_fork_metadata(%{data: data, raw: raw}, target_meta_path, opts) do
-    content =
-      case Keyword.get(opts, :rewrite_cwd) do
-        cwd when is_binary(cwd) ->
-          metadata = data || %{}
-          Jason.encode!(Map.put(metadata, "cwd", cwd), pretty: true)
+    updates = fork_metadata_updates(opts)
 
-        _ ->
-          raw
+    content =
+      if map_size(updates) == 0 do
+        raw
+      else
+        Jason.encode!(Map.merge(data || %{}, updates), pretty: true)
       end
 
     write_file_no_overwrite(target_meta_path, content, :before_meta_publish)
   end
+
+  defp fork_metadata_updates(opts) do
+    %{}
+    |> maybe_put_metadata("cwd", Keyword.get(opts, :rewrite_cwd))
+    |> maybe_put_metadata("title", Keyword.get(opts, :title))
+  end
+
+  defp maybe_put_metadata(metadata, _key, nil), do: metadata
+
+  defp maybe_put_metadata(metadata, key, value) when is_binary(value),
+    do: Map.put(metadata, key, value)
 
   defp write_file_no_overwrite(target_path, content, before_publish_event) do
     with :ok <- ensure_absent(target_path),

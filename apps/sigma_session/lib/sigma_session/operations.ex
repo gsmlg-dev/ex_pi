@@ -173,6 +173,7 @@ defmodule Sigma.Session.Operations do
     %{
       session_id: session_id,
       title: metadata["title"] || session_id,
+      parent_session_id: header && header["parentSession"],
       cwd: cwd,
       cwd_missing?: is_binary(cwd) and not File.dir?(cwd),
       updated_at: stat.mtime |> mtime_to_iso8601(),

@@ -156,6 +156,42 @@ defmodule Sigma.Session.EntryDecoder do
 
   def compaction(_entry), do: {:error, :invalid_compaction}
 
+  @metrics_facts ~w(request_started request_finished request_usage turn_started turn_finished tool_finished compaction operation_started operation_finished)
+
+  @doc "Decodes a durable operational metrics entry without turning it into a model message."
+  def metrics(%{"type" => "metrics", "fact" => fact, "data" => data})
+      when fact in @metrics_facts and is_map(data) do
+    {:ok, {String.to_existing_atom(fact), decode_metrics_data(data)}}
+  rescue
+    ArgumentError -> {:error, :invalid_metrics_fact}
+  end
+
+  def metrics(_entry), do: {:error, :invalid_metrics}
+
+  defp decode_metrics_data(data) do
+    Map.new(data, fn {key, value} -> {key, decode_metrics_value(key, value)} end)
+  end
+
+  defp decode_metrics_value(key, value) when key in ["status", "purpose"] and is_binary(value) do
+    case {key, value} do
+      {"status", "started"} -> :started
+      {"status", "running"} -> :running
+      {"status", "completed"} -> :completed
+      {"status", "failed"} -> :failed
+      {"status", "cancelled"} -> :cancelled
+      {"status", "committed"} -> :committed
+      {"status", "interrupted"} -> :interrupted
+      {"status", "unknown"} -> :unknown
+      {"purpose", "turn"} -> :turn
+      {"purpose", "compaction"} -> :compaction
+      {"purpose", "auxiliary"} -> :auxiliary
+      {"purpose", "sampling"} -> :sampling
+      _ -> value
+    end
+  end
+
+  defp decode_metrics_value(_key, value), do: value
+
   defp required_enum(value, values, field) when is_binary(value) do
     case Map.fetch(values, value) do
       {:ok, atom} -> {:ok, atom}

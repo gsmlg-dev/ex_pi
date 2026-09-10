@@ -2,7 +2,7 @@ defmodule Sigma.Session.JournalTest do
   use ExUnit.Case, async: true
 
   alias Sigma.Agent.Message
-  alias Sigma.Session.{Journal, Snapshot}
+  alias Sigma.Session.{EntryDecoder, Journal, Metrics, Snapshot}
 
   test "replays a linear v3 journal into a deterministic snapshot" do
     entries = [
@@ -461,6 +461,35 @@ defmodule Sigma.Session.JournalTest do
             }} = Journal.replay(entries)
   end
 
+  test "safely ignores unknown metrics facts without advancing the active leaf" do
+    unknown = "future_metrics_fact_#{System.unique_integer([:positive])}"
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown) end
+
+    entries = [
+      header("session", "/repo"),
+      message_entry("root", nil, "message-1", "user", "hello"),
+      %{
+        "type" => "metrics",
+        "id" => "future-metric",
+        "parentId" => "root",
+        "timestamp" => "2026-09-09T00:00:00Z",
+        "fact" => unknown,
+        "data" => %{"future" => true}
+      }
+    ]
+
+    assert {:ok,
+            %Snapshot{
+              active_leaf_id: "root",
+              branch_entry_ids: ["root"],
+              messages: [%Message{id: "message-1"}],
+              diagnostics: [],
+              metrics: %{facts: 0}
+            }} = Journal.replay(entries)
+
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown) end
+  end
+
   test "returns the index error for an unknown explicit leaf" do
     entries = [
       header("session", "/repo"),
@@ -815,6 +844,202 @@ defmodule Sigma.Session.JournalTest do
     assert assistant.content == [%{type: :text, text: "I will inspect it."}]
     assert next_user.role == :user
     assert [%{kind: :message_repair, reason: {:orphaned_tool_call, "call-orphan"}}] = diagnostics
+  end
+
+  test "restart replay projects unfinished requests as interrupted without treating operations as requests" do
+    entries = [
+      header("session", "/repo"),
+      state_entry("request-start", nil, "metrics", %{
+        "fact" => "request_started",
+        "data" => %{
+          "request_id" => "request-1",
+          "session_id" => "session",
+          "turn_id" => "turn-1",
+          "status" => "running",
+          "started_at" => "2026-09-09T08:00:00Z"
+        }
+      }),
+      state_entry("operation-start", nil, "metrics", %{
+        "fact" => "operation_started",
+        "data" => %{
+          "operation_id" => "operation-1",
+          "status" => "started"
+        }
+      })
+    ]
+
+    assert {:ok, %Snapshot{metrics: metrics}} = Journal.replay(entries)
+
+    assert %{status: :interrupted, usage_status: :unknown, elapsed_ms: nil} =
+             metrics.requests["request-1"]
+
+    assert map_size(metrics.requests) == 1
+    assert metrics.facts == 1
+    projection = Sigma.Session.Metrics.snapshot(metrics)
+    assert projection.coverage == %{known: 0, total: 1, ratio: 0.0}
+    assert projection.turns["turn-1"].status == :interrupted
+  end
+
+  test "replays 10,000 heterogeneous durable metric records incrementally without changing the active branch" do
+    root = message_entry("root", nil, "user-1", "user", "hello")
+    old_leaf = message_entry("old-leaf", "root", "old-message", "assistant", "old answer")
+    active_user = message_entry("active-user", "root", "user-2", "user", "try another way")
+
+    active_leaf =
+      message_entry("active-leaf", "active-user", "active-message", "assistant", "new answer")
+
+    bulk =
+      for index <- 1..9_993 do
+        state_entry("metric-#{index}", "root", "metrics", %{
+          "fact" => "request_finished",
+          "data" => %{
+            "request_id" => "request-#{index}",
+            "session_id" => "session",
+            "turn_id" => "turn-#{index}",
+            "revision" => 1,
+            "status" => "completed",
+            "input_tokens_total" => 1,
+            "output_tokens_total" => 1,
+            "elapsed_ms" => 10
+          }
+        })
+      end
+
+    special = [
+      state_entry("metric-old-branch", "old-leaf", "metrics", %{
+        "fact" => "request_finished",
+        "data" => %{
+          "request_id" => "old-branch-request",
+          "session_id" => "session",
+          "turn_id" => "old-turn",
+          "message_id" => "old-message",
+          "revision" => 1,
+          "status" => "completed",
+          "input_tokens_total" => 2,
+          "output_tokens_total" => 2
+        }
+      }),
+      state_entry("metric-failed-auxiliary", "active-leaf", "metrics", %{
+        "fact" => "request_finished",
+        "data" => %{
+          "request_id" => "failed-auxiliary",
+          "session_id" => "session",
+          "turn_id" => "active-turn",
+          "purpose" => "auxiliary",
+          "revision" => 1,
+          "status" => "failed",
+          "input_tokens_total" => 3,
+          "output_tokens_total" => 2
+        }
+      }),
+      state_entry("metric-compaction-request", "active-leaf", "metrics", %{
+        "fact" => "request_finished",
+        "data" => %{
+          "request_id" => "compaction-request",
+          "session_id" => "session",
+          "purpose" => "compaction",
+          "revision" => 1,
+          "status" => "completed",
+          "input_tokens_total" => 8,
+          "output_tokens_total" => 2
+        }
+      }),
+      state_entry("metric-inherited", "root", "metrics", %{
+        "fact" => "request_finished",
+        "data" => %{
+          "request_id" => "inherited-request",
+          "session_id" => "parent-session",
+          "origin_session_id" => "parent-session",
+          "revision" => 1,
+          "status" => "completed",
+          "input_tokens_total" => 10,
+          "output_tokens_total" => 3
+        }
+      }),
+      state_entry("metric-compaction-started", "active-leaf", "metrics", %{
+        "fact" => "compaction",
+        "data" => %{
+          "compaction_id" => "compaction-1",
+          "revision" => 0,
+          "status" => "started",
+          "source_leaf_id" => "active-leaf"
+        }
+      }),
+      state_entry("metric-compaction-committed", "active-leaf", "metrics", %{
+        "fact" => "compaction",
+        "data" => %{
+          "compaction_id" => "compaction-1",
+          "revision" => 1,
+          "status" => "committed",
+          "source_leaf_id" => "active-leaf",
+          "request_ids" => ["compaction-request"],
+          "before_tokens" => 100_000,
+          "after_tokens" => 25_000
+        }
+      })
+    ]
+
+    correction =
+      state_entry("metric-request-correction", "active-leaf", "metrics", %{
+        "fact" => "request_usage",
+        "data" => %{
+          "request_id" => "request-1",
+          "session_id" => "session",
+          "turn_id" => "turn-1",
+          "revision" => 2,
+          "status" => "completed",
+          "input_tokens_total" => 1,
+          "output_tokens_total" => 3,
+          "elapsed_ms" => 10
+        }
+      })
+
+    base_entries =
+      [header("session", "/repo"), root, old_leaf, active_user, active_leaf] ++ bulk ++ special
+
+    assert {:ok, %Snapshot{} = base_snapshot} = Journal.replay(base_entries)
+    assert {:ok, %Snapshot{} = snapshot} = Journal.replay(base_entries ++ [correction])
+
+    assert [
+             %Message{id: "user-1"},
+             %Message{id: "user-2"},
+             %Message{id: "active-message"}
+           ] = snapshot.messages
+
+    assert snapshot.active_leaf_id == "active-leaf"
+    assert snapshot.metrics.facts == 10_000
+
+    projection = Metrics.snapshot(snapshot.metrics)
+    assert projection.request_count == 9_996
+    assert projection.own_usage.total_tokens == 20_007
+    assert projection.inherited_usage.total_tokens == 13
+    assert projection.usage_by_purpose.auxiliary.total_tokens == 5
+    assert projection.usage_by_purpose.compaction.total_tokens == 10
+    assert projection.successful_compactions == 1
+
+    assert %{
+             attempt_count: 1,
+             successful_count: 1,
+             failed_count: 0,
+             last_successful: %{compaction_id: "compaction-1", after_tokens: 25_000}
+           } = projection.compaction_summary
+
+    assert %{status: :failed, purpose: :auxiliary} =
+             projection.requests["failed-auxiliary"]
+
+    assert %{message_id: "old-message", turn_id: "old-turn"} =
+             projection.requests["old-branch-request"]
+
+    assert {:ok, correction_fact} = EntryDecoder.metrics(correction)
+    stats_before_correction = Metrics.projection_stats(base_snapshot.metrics)
+    incremented = Metrics.reduce(base_snapshot.metrics, correction_fact)
+
+    assert Metrics.snapshot(incremented) == projection
+    assert incremented.facts == base_snapshot.metrics.facts + 1
+    assert map_size(incremented.requests) == map_size(base_snapshot.metrics.requests)
+
+    assert Metrics.projection_stats(incremented).historical_items_visited ==
+             stats_before_correction.historical_items_visited
   end
 
   defp header(id, cwd) do

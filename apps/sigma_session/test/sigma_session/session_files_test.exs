@@ -3,6 +3,7 @@ defmodule Sigma.Session.SessionFilesTest do
 
   alias Sigma.Agent.Message
   alias Sigma.Session.Log
+  alias Sigma.Session.Metrics
   alias Sigma.Session.SessionFiles
   alias Sigma.Session.Storage.JsonlFile
 
@@ -149,6 +150,59 @@ defmodule Sigma.Session.SessionFilesTest do
     refute File.exists?(meta_path(tmp_dir, "old"))
   end
 
+  test "rename preserves metrics identity, ownership, and totals", %{tmp_dir: tmp_dir} do
+    source_path = write_session!(tmp_dir, "old")
+    assert {:ok, initial_snapshot} = Log.snapshot(source_path)
+    stable_session_id = initial_snapshot.session_id
+
+    :ok =
+      Log.persist_event(
+        source_path,
+        {:request_finished,
+         %{
+           request_id: "own-request",
+           session_id: stable_session_id,
+           revision: 1,
+           status: :completed,
+           input_tokens_total: 7,
+           output_tokens_total: 5
+         }}
+      )
+
+    :ok =
+      Log.persist_event(
+        source_path,
+        {:request_finished,
+         %{
+           request_id: "inherited-request",
+           session_id: "parent-session",
+           origin_session_id: "parent-session",
+           revision: 1,
+           status: :completed,
+           input_tokens_total: 11,
+           output_tokens_total: 2
+         }}
+      )
+
+    write_meta!(tmp_dir, "old", %{"cwd" => "/tmp/project"})
+    assert {:ok, before_snapshot} = Log.snapshot(source_path)
+    before_projection = Metrics.snapshot(before_snapshot.metrics)
+
+    assert before_projection.session_id == stable_session_id
+    assert before_projection.own_usage.total_tokens == 12
+    assert before_projection.inherited_usage.total_tokens == 13
+
+    assert :ok = SessionFiles.rename(tmp_dir, "old", "new")
+    assert {:ok, after_snapshot} = Log.snapshot(jsonl_path(tmp_dir, "new"))
+    after_projection = Metrics.snapshot(after_snapshot.metrics)
+
+    assert after_snapshot.session_id == stable_session_id
+    assert after_snapshot.metrics == before_snapshot.metrics
+    assert after_projection == before_projection
+    assert after_projection.own_usage.total_tokens == 12
+    assert after_projection.inherited_usage.total_tokens == 13
+  end
+
   test "rename refuses an existing target jsonl", %{tmp_dir: tmp_dir} do
     File.write!(jsonl_path(tmp_dir, "old"), "old\n")
     File.write!(jsonl_path(tmp_dir, "new"), "new\n")
@@ -275,6 +329,13 @@ defmodule Sigma.Session.SessionFilesTest do
 
     :ok = Log.persist_event(source_jsonl, {:agent_start, "/tmp/project"})
     :ok = Log.persist_event(source_jsonl, {:message_end, Message.user("msg_1", "hello")})
+
+    :ok =
+      Log.persist_event(
+        source_jsonl,
+        {:message_end, Message.assistant("msg_2", %{content: "done"})}
+      )
+
     write_meta!(tmp_dir, "source", metadata)
 
     assert {:ok, _new_log_session_id} = SessionFiles.fork(tmp_dir, "source", "target", :all)
@@ -282,12 +343,14 @@ defmodule Sigma.Session.SessionFilesTest do
     assert read_meta!(tmp_dir, "target") == metadata
 
     assert {:ok, entries} = JsonlFile.read(jsonl_path(tmp_dir, "target"))
+
     assert [%{"type" => "session", "cwd" => "/tmp/project/.trees/feature"} | _branch] =
              entries
 
     assert 1 == Enum.count(entries, &(&1["type"] == "session"))
 
-    assert {:ok, [%Message{id: "msg_1"}]} = Log.replay(jsonl_path(tmp_dir, "target"))
+    assert {:ok, [%Message{id: "msg_1"}, %Message{id: "msg_2"}]} =
+             Log.replay(jsonl_path(tmp_dir, "target"))
   end
 
   test "fork refuses an existing target jsonl", %{tmp_dir: tmp_dir} do
@@ -361,6 +424,22 @@ defmodule Sigma.Session.SessionFilesTest do
 
     assert {:ok, entries} = JsonlFile.read(jsonl_path(tmp_dir, "target"))
     assert [%{"type" => "session", "cwd" => "/tmp/project"} | _branch] = entries
+  end
+
+  test "fork records an explicit target title without changing inherited metadata", %{
+    tmp_dir: tmp_dir
+  } do
+    write_session!(tmp_dir, "source")
+    write_meta!(tmp_dir, "source", %{"cwd" => "/tmp/project", "branch" => "main"})
+
+    assert {:ok, _new_log_session_id} =
+             SessionFiles.fork(tmp_dir, "source", "target", :all, title: "Investigate parser")
+
+    assert read_meta!(tmp_dir, "target") == %{
+             "cwd" => "/tmp/project",
+             "branch" => "main",
+             "title" => "Investigate parser"
+           }
   end
 
   test "adopt relocates conversation bytes and preserves structural metadata", %{tmp_dir: tmp_dir} do
@@ -438,6 +517,7 @@ defmodule Sigma.Session.SessionFilesTest do
              )
 
     assert File.read!(source_jsonl) == source_before
+
     assert read_meta!(source_dir, "orphan") == %{
              "cwd" => "/missing/original",
              "branch" => "main"
@@ -485,6 +565,13 @@ defmodule Sigma.Session.SessionFilesTest do
     jsonl_path = jsonl_path(dir, id)
     :ok = Log.persist_event(jsonl_path, {:agent_start, "/tmp/project"})
     :ok = Log.persist_event(jsonl_path, {:message_end, Message.user("msg_1", "hello")})
+
+    :ok =
+      Log.persist_event(
+        jsonl_path,
+        {:message_end, Message.assistant("msg_2", %{content: "done"})}
+      )
+
     jsonl_path
   end
 

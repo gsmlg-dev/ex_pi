@@ -82,7 +82,7 @@ defmodule Sigma.Session.Journal.Index do
   def path(index, selector \\ :latest)
 
   def path(%__MODULE__{} = index, :latest) do
-    leaf_id = index.ordered |> List.last() |> node_id()
+    leaf_id = index.ordered |> Enum.reverse() |> Enum.find(&conversation_node?/1) |> node_id()
     path(index, leaf_id)
   end
 
@@ -95,6 +95,9 @@ defmodule Sigma.Session.Journal.Index do
       {:error, {:leaf_not_found, leaf_id}}
     end
   end
+
+  defp conversation_node?(%{entry: %{"type" => "metrics"}}), do: false
+  defp conversation_node?(_node), do: true
 
   defp insert({entry, entry_index}, index) do
     case validate_entry(entry, entry_index, index) do

@@ -11,6 +11,7 @@ defmodule Sigma.Protocol.Envelope do
     session.status
     session.switch
     session.fork
+    session.retry
     session.dump
     session.export
     prompt.submit
@@ -29,6 +30,7 @@ defmodule Sigma.Protocol.Envelope do
 
   @events ~w(
     session.snapshot
+    metrics.changed
     prompt.admitted
     turn.started
     message.started
@@ -44,6 +46,8 @@ defmodule Sigma.Protocol.Envelope do
     session.error
     skill.invocation.updated
   )
+
+  @capabilities ~w(metrics.v1 subscription.cursor.v1 subscription.resync.v1)
 
   @enforce_keys [:version, :id, :session_id, :timestamp, :type, :kind]
   defstruct [
@@ -75,6 +79,7 @@ defmodule Sigma.Protocol.Envelope do
   def version, do: @version
   def commands, do: @commands
   def events, do: @events
+  def capabilities, do: @capabilities
 
   def command(type, session_id, payload \\ %{}, opts \\ [])
 

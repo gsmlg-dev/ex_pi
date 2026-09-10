@@ -3,7 +3,7 @@ defmodule Sigma.Session.Journal do
   Pure validation and replay of one active session-journal branch.
   """
 
-  alias Sigma.Session.{EntryDecoder, Snapshot}
+  alias Sigma.Session.{EntryDecoder, Metrics, Snapshot}
   alias Sigma.Session.Journal.Index
 
   @service_tier_values ~w(auto default flex scale priority)
@@ -24,10 +24,12 @@ defmodule Sigma.Session.Journal do
         session_id: header && header["id"],
         cwd: header && header["cwd"],
         parent_session_id: header && header["parentSession"],
-        active_leaf_id: leaf_id,
+        active_leaf_id: conversation_leaf_id(nodes, leaf_id),
         branch_entry_ids: Enum.map(nodes, & &1.entry["id"]),
         message_entry_ids: message_entry_ids(nodes)
       }
+
+      snapshot = %{snapshot | metrics: metrics_snapshot(index, snapshot.session_id)}
 
       {snapshot, payload_diagnostics_rev} =
         Enum.reduce(nodes, {snapshot, []}, &reduce_entry/2)
@@ -156,7 +158,40 @@ defmodule Sigma.Session.Journal do
     end)
   end
 
+  defp reduce_entry(%{entry: %{"type" => "metrics"} = entry}, {snapshot, diagnostics}) do
+    case EntryDecoder.metrics(entry) do
+      {:ok, _fact} ->
+        {snapshot, diagnostics}
+
+      {:error, reason} ->
+        {snapshot, [payload_diagnostic_from_entry(entry, reason) | diagnostics]}
+    end
+  end
+
   defp reduce_entry(_node, acc), do: acc
+
+  defp metrics_snapshot(index, session_id) do
+    index.ordered
+    |> Enum.filter(&match?(%{entry: %{"type" => "metrics"}}, &1))
+    |> Enum.reduce(Metrics.new(session_id), fn %{entry: entry}, metrics ->
+      case EntryDecoder.metrics(entry) do
+        {:ok, fact} -> Metrics.reduce(metrics, fact)
+        {:error, _reason} -> metrics
+      end
+    end)
+    |> Metrics.finalize_in_flight()
+  end
+
+  defp conversation_leaf_id(nodes, fallback) do
+    nodes
+    |> Enum.reverse()
+    |> Enum.find_value(fallback, fn %{entry: %{"type" => type, "id" => id}} ->
+      if type != "metrics", do: id
+    end)
+  end
+
+  defp payload_diagnostic_from_entry(entry, reason),
+    do: %{kind: :invalid_payload, entry_id: entry["id"], reason: reason}
 
   defp message_entry_ids(nodes) do
     Enum.reduce(nodes, %{}, fn

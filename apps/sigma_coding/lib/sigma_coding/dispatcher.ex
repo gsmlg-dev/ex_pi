@@ -116,7 +116,9 @@ defmodule Sigma.Coding.Dispatcher do
     )
 
     started_at = System.monotonic_time()
-    normalized = Tool.execute(tool, tool_call.id, tool_call.arguments, tool_opts) |> ToolResult.normalize()
+
+    normalized =
+      Tool.execute(tool, tool_call.id, tool_call.arguments, tool_opts) |> ToolResult.normalize()
 
     :telemetry.execute(
       [:sigma, :tool, :call, :stop],
@@ -129,8 +131,36 @@ defmodule Sigma.Coding.Dispatcher do
       }
     )
 
-    apply_post_tool_use_hooks(normalized, tool_call, hook_specs, hook_ctx)
+    result = apply_post_tool_use_hooks(normalized, tool_call, hook_specs, hook_ctx)
+    emit_tool_fact(opts, tool_call, result, started_at)
+    result
   end
+
+  defp emit_tool_fact(opts, tool_call, result, started_at) do
+    callback = Keyword.get(opts, :on_tool_fact)
+
+    if is_function(callback, 1) do
+      callback.(%{
+        tool_id: tool_call.id,
+        turn_id: Keyword.get(opts, :turn_id),
+        request_id: Keyword.get(opts, :request_id),
+        status: tool_status(result),
+        error_kind: tool_error_kind(result),
+        elapsed_ms:
+          max(
+            System.convert_time_unit(System.monotonic_time() - started_at, :native, :millisecond),
+            0
+          )
+      })
+    end
+  end
+
+  defp tool_status({:ok, %ToolResult{is_error: true}}), do: :failed
+  defp tool_status({:ok, %ToolResult{}}), do: :completed
+  defp tool_status({:error, _error}), do: :failed
+
+  defp tool_error_kind({:error, %ToolError{kind: kind}}), do: kind
+  defp tool_error_kind(_result), do: nil
 
   defp put_update_callback(opts, tool_call) do
     case Keyword.get(opts, :on_tool_update) || Keyword.get(opts, :on_update) do

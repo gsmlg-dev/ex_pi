@@ -81,6 +81,44 @@ defmodule Sigma.Session.EntryEncoder do
     {:ok, entry("skill_invocation", parent_id, %{"invocation" => invocation})}
   end
 
+  alias Sigma.Protocol.Metrics
+
+  @metrics_facts ~w(request_started request_finished request_usage turn_started turn_finished tool_finished compaction operation_started operation_finished)
+  @request_metrics_facts ~w(request_started request_finished request_usage)
+
+  def encode({:metrics, fact, attrs}, parent_id, _header?)
+      when (is_atom(fact) or is_binary(fact)) and is_map(attrs) do
+    fact = to_string(fact)
+
+    if fact in @metrics_facts do
+      attrs =
+        if fact in @request_metrics_facts, do: Metrics.sanitize_request_fact(attrs), else: attrs
+
+      {:ok,
+       entry("metrics", parent_id, %{
+         "fact" => fact,
+         "data" => encode_data(attrs)
+       })}
+    else
+      {:error, {:invalid_metrics_fact, fact}}
+    end
+  end
+
+  def encode({fact, attrs}, parent_id, header?)
+      when fact in [
+             :request_started,
+             :request_finished,
+             :request_usage,
+             :turn_started,
+             :turn_finished,
+             :tool_finished,
+             :compaction,
+             :operation_started,
+             :operation_finished
+           ] and
+             is_map(attrs),
+      do: encode({:metrics, fact, attrs}, parent_id, header?)
+
   def encode(_event, _parent_id, _header?), do: :ignored
 
   defp entry(type, parent_id, payload) do
@@ -101,6 +139,35 @@ defmodule Sigma.Session.EntryEncoder do
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
   end
+
+  defp encode_data(data) when is_struct(data) do
+    module = data.__struct__
+
+    data
+    |> Map.from_struct()
+    |> Map.new(fn {key, value} -> {to_string(key), encode_value(value)} end)
+    |> Map.put("__struct__", Atom.to_string(module))
+  end
+
+  defp encode_data(data) when is_map(data) do
+    Map.new(data, fn {key, value} -> {to_string(key), encode_value(value)} end)
+  end
+
+  defp encode_value(value) when is_atom(value), do: Atom.to_string(value)
+
+  defp encode_value(value) when is_struct(value) do
+    encode_data(value)
+  end
+
+  defp encode_value(value) when is_map(value), do: encode_data(value)
+  defp encode_value(value) when is_list(value), do: Enum.map(value, &encode_value/1)
+  defp encode_value(value) when is_tuple(value), do: value |> Tuple.to_list() |> encode_value()
+
+  defp encode_value(value)
+       when is_nil(value) or is_boolean(value) or is_number(value) or is_binary(value),
+       do: value
+
+  defp encode_value(value), do: inspect(value, limit: 50, printable_limit: 1_000)
 
   defp entry_id, do: :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
   defp session_id, do: :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
