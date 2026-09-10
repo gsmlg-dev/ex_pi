@@ -16,8 +16,8 @@
 
 | 文档 | 说明 |
 | --- | --- |
-| [protocol-v1.md](contracts/protocol-v1.md) | Protocol V1：命令/事件信封与适配器边界 |
-| [public-runtime-integration.md](contracts/public-runtime-integration.md) | PublicRuntime 集成笔记：Synapsis/Samgita 命令子集、订阅/审批边界 |
+| [protocol-v1.md](contracts/protocol-v1.md) | Protocol V1：命令/事件信封、metrics capability、cursor/resync 与兼容边界 |
+| [public-runtime-integration.md](contracts/public-runtime-integration.md) | PublicRuntime 集成笔记：订阅恢复、Retry/Fork、privacy 与降级边界 |
 | [context-rules-v2.md](contracts/context-rules-v2.md) | Context Rules V2：AGENTS/CLAUDE 装配与指令 |
 | [build-api-session-context.md](contracts/build-api-session-context.md) | 会话上下文如何组装并送入 provider |
 | [session-journal-and-operations-v2-prd.md](contracts/session-journal-and-operations-v2-prd.md) | Session journal / 会话操作 V2 PRD |
@@ -37,6 +37,7 @@
 | 文档 | 说明 |
 | --- | --- |
 | [hooks/](features/hooks/) | Hook 系统设计、PRD、实现与生命周期计划 |
+| [session-ui/](features/session-ui/) | Session UI Observability V2：PRD、契约、实施计划与报告 |
 | [tools.md](features/tools.md) | `sigma_tools` / oh-my-pi 风格工具面 PRD |
 | [providers.md](features/providers.md) | Provider 扩展 playbook：OpenAI-compat 配置、`stream_normalized`、错误/取消/fixture 清单 |
 
