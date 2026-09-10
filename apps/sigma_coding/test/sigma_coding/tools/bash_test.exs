@@ -52,6 +52,23 @@ defmodule Sigma.Coding.Tools.BashTest do
     assert text2 =~ "part2"
   end
 
+  test "replaces invalid UTF-8 in output and streaming updates" do
+    parent = self()
+    on_update = fn result -> send(parent, {:update, result}) end
+
+    params = %{"command" => "printf '\\265'"}
+    opts = [cwd: @cwd, on_update: on_update]
+
+    assert {:ok, result} = Bash.execute("1", params, opts)
+    assert [%{text: "�" = text}] = result.content
+    assert String.valid?(text)
+    assert {:ok, _json} = Jason.encode(result)
+
+    assert_receive {:update, %{content: [%{text: update_text}]}}, 500
+    assert update_text == "�"
+    assert String.valid?(update_text)
+  end
+
   test "handles timeout" do
     # Command that takes 2 seconds, with a 1 second timeout
     params = %{"command" => "sleep 2", "timeout" => 1}

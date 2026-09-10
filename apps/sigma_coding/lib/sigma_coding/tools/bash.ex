@@ -71,7 +71,7 @@ defmodule Sigma.Coding.Tools.Bash do
 
         if on_update do
           on_update.(%{
-            content: [%{type: :text, text: Enum.join(Enum.reverse(new_acc), "")}],
+            content: [%{type: :text, text: output_text(new_acc)}],
             details: %{status: :running}
           })
         end
@@ -79,8 +79,15 @@ defmodule Sigma.Coding.Tools.Bash do
         collect_output(port, new_acc, on_update)
 
       {^port, {:exit_status, status}} ->
-        %{exit_code: status, output: Enum.join(Enum.reverse(acc), "")}
+        %{exit_code: status, output: output_text(acc)}
     end
+  end
+
+  defp output_text(chunks) do
+    chunks
+    |> Enum.reverse()
+    |> IO.iodata_to_binary()
+    |> String.replace_invalid()
   end
 
   defp wait_for_task(task, signal, timeout_ms, command) do
