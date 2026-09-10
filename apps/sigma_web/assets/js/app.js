@@ -3,6 +3,7 @@ import {Socket} from "phoenix"
 import {LiveSocket} from "phoenix_live_view"
 import topbar from "topbar"
 import * as DuskmoonHooks from "phoenix_duskmoon/hooks"
+import { FitAddon } from "@xterm/addon-fit"
 import { Terminal } from "@xterm/xterm"
 import { encodeImageFiles } from "./chat_attachments.js"
 import { shouldClearComposer } from "./chat_submission.js"
@@ -665,6 +666,9 @@ const WebShellTerminal = {
     this._lastSize = { cols: null, rows: null }
     this._disposables = []
     this.el.innerHTML = ''
+    this._terminalHost = document.createElement('div')
+    this._terminalHost.className = 'web-shell-terminal-host'
+    this.el.appendChild(this._terminalHost)
 
     this._terminal = new Terminal({
       // Raw PTY output must preserve CR/LF exactly for full-screen programs.
@@ -681,8 +685,10 @@ const WebShellTerminal = {
         selectionBackground: '#334155'
       }
     })
+    this._fitAddon = new FitAddon()
+    this._terminal.loadAddon(this._fitAddon)
 
-    this._terminal.open(this.el)
+    this._terminal.open(this._terminalHost)
     this._terminal.write(`Shell ready: ${this.el.dataset.cwd || ''}\r\n`)
     this._terminal.focus()
     this._disposables.push(this._terminal.onData((data) => this.pushEvent('web_shell_input', { data })))
@@ -701,7 +707,7 @@ const WebShellTerminal = {
 
     this._resize = () => this._fit()
     this._resizeObserver = new ResizeObserver(this._resize)
-    this._resizeObserver.observe(this.el)
+    this._resizeObserver.observe(this._terminalHost)
     window.addEventListener('resize', this._resize)
     window.requestAnimationFrame(this._resize)
   },
@@ -714,11 +720,11 @@ const WebShellTerminal = {
   _fit() {
     if (!this._terminal) return
 
-    const rect = this.el.getBoundingClientRect()
+    const rect = this._terminalHost.getBoundingClientRect()
     if (rect.width === 0 || rect.height === 0) return
 
-    const cols = Math.max(40, Math.floor(rect.width / 8.2))
-    const rows = Math.max(8, Math.floor(rect.height / 17.5))
+    this._fitAddon.fit()
+    const { cols, rows } = this._terminal
 
     if (cols === this._lastSize.cols && rows === this._lastSize.rows) return
 

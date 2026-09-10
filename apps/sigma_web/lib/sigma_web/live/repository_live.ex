@@ -75,7 +75,7 @@ defmodule Sigma.Web.RepositoryLive do
             <.dm_card
               :for={s <- @sessions}
               variant="bordered"
-              class="group interactive hover:shadow-xl transition-all duration-300 bg-surface-container-low"
+              class="grid-stretch h-full group interactive hover:shadow-xl transition-all duration-300 bg-surface-container-low"
             >
               <:title class="min-w-0 flex-1 overflow-hidden">
                 <div class="flex w-full min-w-0 max-w-full items-center justify-between gap-3 overflow-hidden py-1 text-on-surface">

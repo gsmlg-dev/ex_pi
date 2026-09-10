@@ -16,6 +16,7 @@
     "@duskmoon-dev/el-markdown-input": "1.7.5",
     "@duskmoon-dev/el-menu": "1.7.5",
     "@duskmoon-dev/elements": "1.7.5",
+    "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "topbar": "3.0.1"
   }

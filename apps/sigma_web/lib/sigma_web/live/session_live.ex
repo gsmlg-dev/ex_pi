@@ -12,6 +12,9 @@ defmodule Sigma.Web.SessionLive do
   alias Phoenix.LiveView.AsyncResult
 
   @fork_id_attempts 5
+  # Agent startup initializes MCP clients serially; allow that bounded startup
+  # window to finish before treating the session as unavailable.
+  @session_start_timeout_ms 120_000
 
   @impl true
   def mount(%{"id" => session_id, "repository" => encoded_repository}, _session, socket) do
@@ -183,7 +186,7 @@ defmodule Sigma.Web.SessionLive do
              {:ok, sessions} <- Sigma.Session.Log.list_session_summaries(sessions_dir) do
           agent = runtime_session.agent
           runtime_status = Sigma.Agent.Runtime.session_status(workdir, session_id)
-          agent_status = Sigma.Agent.status(agent)
+          agent_status = load_agent_status(agent)
 
           pending_user_questions = load_pending_user_questions(agent)
           model_options = model_options(system_config, provider_id)
@@ -1153,6 +1156,7 @@ defmodule Sigma.Web.SessionLive do
     ~H"""
     <.dm_chat
       id={@message.id}
+      class="sigma-chat-with-actions"
       align="start"
       color="secondary"
       avatar="You"
@@ -1224,6 +1228,7 @@ defmodule Sigma.Web.SessionLive do
     ~H"""
     <.dm_chat
       id={@message.id}
+      class="sigma-chat-with-actions"
       align="start"
       avatar="∑"
       author="∑"
@@ -3194,6 +3199,10 @@ defmodule Sigma.Web.SessionLive do
     Sigma.Agent.pending_user_questions(agent, 100)
   catch
     :exit, _reason -> []
+  end
+
+  defp load_agent_status(agent) do
+    GenServer.call(agent, :status, @session_start_timeout_ms)
   end
 
   defp load_pending_mcp_elicitations(agent) do

@@ -1530,6 +1530,7 @@ defmodule Sigma.Web.SessionLiveTest do
     {:ok, view, html} = live_loaded(conn, session_path(session_id))
     assert html =~ ~s(id="retry-turn-retry-user")
     assert html =~ ~s(id="retry-retry-user")
+    assert Floki.find(Floki.parse_document!(html), "#retry-user.sigma-chat-with-actions") != []
 
     modal_html = render_click(view, "prepare_retry", %{"msg-id" => "retry-user"})
     assert modal_html =~ ~s(id="retry-turn-modal")

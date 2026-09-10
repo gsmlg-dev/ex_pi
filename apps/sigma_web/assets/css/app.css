@@ -31,6 +31,14 @@ el-dm-dialog [slot="footer"] {
   gap: 0.5rem;
 }
 
+/* Grid items: make el-dm-card propagate host height to its inner .card div
+   so cards in the same row share the same height and the action button sticks
+   to the bottom. Display: grid stretches the single shadow child to fill. */
+el-dm-card.grid-stretch {
+  display: grid;
+  grid-template-rows: 1fr;
+}
+
 .settings-table thead {
   display: table-header-group !important;
 }
@@ -93,6 +101,11 @@ el-dm-button:focus-within {
 .sigma-session-transcript {
   min-height: 0;
   scrollbar-gutter: stable;
+}
+
+/* el-chat currently detects quick actions but not custom action slots. */
+el-dm-chat.sigma-chat-with-actions::part(actions) {
+  display: block;
 }
 
 .sigma-session-composer {
@@ -322,6 +335,13 @@ el-dm-button:focus-within {
   overflow: hidden;
   background: #0b0f14;
   padding: 0.75rem;
+}
+
+.web-shell-terminal-host {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .web-shell-terminal .xterm {

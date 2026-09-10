@@ -59,10 +59,10 @@ defmodule Sigma.Web.HomeLive do
       </div>
 
       <div :if={@live_action == :index && !Enum.empty?(@repos)} class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-        <.dm_card 
-          :for={repo <- @repos} 
-          variant="bordered" 
-          class="group interactive transition-all duration-300 hover:border-primary/50 hover:shadow-xl bg-surface-container-low"
+        <.dm_card
+          :for={repo <- @repos}
+          variant="bordered"
+          class="grid-stretch h-full group interactive transition-all duration-300 hover:border-primary/50 hover:shadow-xl bg-surface-container-low"
         >
           <:title>
             <div class="flex items-center gap-3 py-1">

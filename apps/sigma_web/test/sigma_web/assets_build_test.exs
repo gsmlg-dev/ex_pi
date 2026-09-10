@@ -24,10 +24,16 @@ defmodule Sigma.Web.AssetsBuildTest do
     assert css =~ ".xterm"
   end
 
-  test "web shell terminal preserves raw pty line endings" do
+  test "web shell terminal preserves raw pty line endings and fits its container" do
     app_js = File.read!(Path.join(@repo_root, "apps/sigma_web/assets/js/app.js"))
 
     assert app_js =~ "convertEol: false"
+    assert app_js =~ ~s|import { FitAddon } from "@xterm/addon-fit"|
+    assert app_js =~ "this._terminal.open(this._terminalHost)"
+    assert app_js =~ "this._resizeObserver.observe(this._terminalHost)"
+    assert app_js =~ "this._terminal.loadAddon(this._fitAddon)"
+    assert app_js =~ "this._fitAddon.fit()"
+    refute app_js =~ "Math.floor(rect.height / 17.5)"
   end
 
   test "auto appearance resolves the OS preference to an explicit theme" do
@@ -48,6 +54,16 @@ defmodule Sigma.Web.AssetsBuildTest do
     assert css =~
              ~r/\.web-shell-terminal\s*\{[^}]*flex:\s*1 1 auto;[^}]*height:\s*auto;[^}]*min-height:\s*0;/s
 
+    assert css =~
+             ~r/\.web-shell-terminal-host\s*\{[^}]*width:\s*100%;[^}]*height:\s*100%;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s
+
     refute css =~ ~r/\.web-shell-terminal\s*\{[^}]*min-height:\s*16rem;/s
+  end
+
+  test "chat messages with action slots expose the DuskMoon actions part" do
+    css = File.read!(Path.join(@repo_root, "apps/sigma_web/assets/css/app.css"))
+
+    assert css =~
+             ~r/el-dm-chat\.sigma-chat-with-actions::part\(actions\)\s*\{[^}]*display:\s*block;/s
   end
 end
