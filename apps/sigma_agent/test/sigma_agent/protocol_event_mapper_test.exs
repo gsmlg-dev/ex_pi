@@ -44,7 +44,9 @@ defmodule Sigma.Agent.ProtocolEventMapperTest do
   test "large reconnect snapshots are truncated into an encodable bounded envelope" do
     messages =
       for index <- 1..30 do
-        content = for block <- 1..20, do: %{type: :text, text: String.duplicate("x", 2_048) <> "#{block}"}
+        content =
+          for block <- 1..20, do: %{type: :text, text: String.duplicate("x", 2_048) <> "#{block}"}
+
         Sigma.Agent.Message.user("message-#{index}", content)
       end
 
@@ -57,6 +59,9 @@ defmodule Sigma.Agent.ProtocolEventMapperTest do
     }
 
     payload = ProtocolEventMapper.snapshot_payload(snapshot)
+    assert payload["protocolVersion"] == Envelope.version()
+    assert "metrics.v1" in payload["capabilities"]
+    assert "subscription.resync.v1" in payload["capabilities"]
     assert payload["messagesTruncated"]
     assert length(payload["messages"]) == 5
     assert length(payload["branchEntryIds"]) == 50
@@ -66,11 +71,148 @@ defmodule Sigma.Agent.ProtocolEventMapperTest do
 
     huge_mcp_snapshot = %{
       snapshot
-      | mcp_server_ids: Enum.map(1..100, &String.duplicate("m", 1_000) <> "#{&1}")
+      | mcp_server_ids: Enum.map(1..100, &(String.duplicate("m", 1_000) <> "#{&1}"))
     }
 
     huge_mcp_payload = ProtocolEventMapper.snapshot_payload(huge_mcp_snapshot)
     assert {:ok, event} = Envelope.event("session.snapshot", "large-session", huge_mcp_payload)
     assert {:ok, _encoded} = Codec.encode(event)
+  end
+
+  test "structured operation conflicts retain safe details" do
+    error = ProtocolEventMapper.public_error({:revision_conflict, %{expected: 2, actual: 3}})
+
+    assert error.code == "revision_conflict"
+    assert error.details == %{"expected" => 2, "actual" => 3}
+  end
+
+  test "metrics snapshots expose deterministic bounded request and turn summaries" do
+    requests =
+      Map.new(1..15, fn index ->
+        id = "request-#{String.pad_leading(to_string(index), 2, "0")}"
+
+        {id,
+         %{
+           request_id: id,
+           status: :completed,
+           started_at: "2026-09-09T10:#{String.pad_leading(to_string(index), 2, "0")}:00Z",
+           provider: String.duplicate("p", 256),
+           model: String.duplicate("模型", 128)
+         }}
+      end)
+
+    turns =
+      Map.new(1..15, fn index ->
+        id = "turn-#{String.pad_leading(to_string(index), 2, "0")}"
+
+        {id,
+         %{
+           status: :completed,
+           started_at: "2026-09-09T10:#{String.pad_leading(to_string(index), 2, "0")}:00Z",
+           request_ids: ["request-#{index}"]
+         }}
+      end)
+
+    projection =
+      ProtocolEventMapper.metrics_snapshot(%{
+        session_id: "session-1",
+        requests: requests,
+        turns: turns
+      })
+
+    assert [
+             %{"request_id" => "request-15", "status" => "completed"},
+             %{"request_id" => "request-14"}
+             | request_summaries
+           ] = projection["requestSummaries"]
+
+    assert length(request_summaries) == 8
+    assert List.last(projection["requestSummaries"])["request_id"] == "request-06"
+    assert byte_size(hd(projection["requestSummaries"])["provider"]) == 128
+    assert byte_size(hd(projection["requestSummaries"])["model"]) <= 128
+    assert String.valid?(hd(projection["requestSummaries"])["model"])
+
+    assert [%{"turn_id" => "turn-15"}, %{"turn_id" => "turn-14"} | turn_summaries] =
+             projection["turnSummaries"]
+
+    assert length(turn_summaries) == 8
+    assert List.last(projection["turnSummaries"])["turn_id"] == "turn-06"
+  end
+
+  test "maps durable metrics facts to a versioned string-keyed event" do
+    {event, turn_id} =
+      ProtocolEventMapper.map(
+        {:metrics, :request_finished,
+         %{
+           request_id: "request-1",
+           session_id: "session-1",
+           revision: 1,
+           status: :completed,
+           input_tokens_total: 12,
+           output_tokens_total: 3
+         }},
+        "session-1",
+        "turn-1"
+      )
+
+    assert turn_id == "turn-1"
+    assert event.type == "metrics.changed"
+    assert event.payload["schemaVersion"] == 1
+    assert event.payload["fact"] == "request_finished"
+    assert event.payload["data"]["request_id"] == "request-1"
+    assert event.payload["data"]["status"] == "completed"
+    assert Enum.all?(Map.keys(event.payload["data"]), &is_binary/1)
+    assert {:ok, encoded} = Codec.encode(event)
+    assert {:ok, ^event} = Codec.decode(encoded)
+  end
+
+  test "maps durable turn lifecycle facts without dropping unknown reasons" do
+    {started, "turn-1"} =
+      ProtocolEventMapper.map(
+        {:metrics, :turn_started,
+         %{
+           turn_id: "turn-1",
+           session_id: "session-1",
+           revision: 0,
+           status: :running,
+           reason: nil,
+           started_at: "2026-09-09T10:00:00Z"
+         }},
+        "session-1",
+        "turn-1"
+      )
+
+    assert started.type == "metrics.changed"
+    assert started.payload["fact"] == "turn_started"
+    assert started.payload["data"]["reason"] == nil
+
+    {finished, "turn-1"} =
+      ProtocolEventMapper.map(
+        {:metrics, :turn_finished,
+         %{
+           turn_id: "turn-1",
+           session_id: "session-1",
+           revision: 1,
+           status: :failed,
+           reason: :unknown,
+           wall_ms: 25
+         }},
+        "session-1",
+        "turn-1"
+      )
+
+    assert finished.payload["fact"] == "turn_finished"
+    assert finished.payload["data"]["status"] == "failed"
+    assert finished.payload["data"]["reason"] == "unknown"
+    assert finished.payload["data"]["wall_ms"] == 25
+  end
+
+  test "rejects unknown metrics facts at the closed protocol boundary" do
+    assert {nil, "turn-1"} =
+             ProtocolEventMapper.map(
+               {:metrics, :unapproved_fact, %{request_id: "request-1", revision: 1}},
+               "session-1",
+               "turn-1"
+             )
   end
 end

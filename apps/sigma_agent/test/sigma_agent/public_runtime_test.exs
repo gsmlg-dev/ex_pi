@@ -4,6 +4,62 @@ defmodule Sigma.Agent.PublicRuntimeTest do
   alias Sigma.Agent.PublicRuntime
   alias Sigma.Protocol.{Codec, Envelope}
 
+  test "runtime snapshot projection exposes bounded public state" do
+    snapshot = %{
+      provider_id: "anthropic",
+      model_id: "claude-test",
+      metrics: %{own_usage: %{input_tokens_total: 4, output_tokens_total: 2}}
+    }
+
+    projection =
+      PublicRuntime.runtime_snapshot(
+        %{status: :turn_running, pid: self()},
+        %{
+          phase: :streaming_provider,
+          turn_id: "turn-1",
+          current_request_id: "request-1",
+          context_snapshot: %{
+            active_leaf: "leaf-1",
+            context_revision: 3,
+            model: %{id: "claude-test"},
+            source: :provider_usage,
+            generated_at: "2026-09-09T10:00:00Z",
+            stale: false
+          },
+          context_policy: %{
+            check_phase: :before_provider_dispatch,
+            overflow: :within_budget
+          }
+        },
+        snapshot,
+        42
+      )
+
+    assert projection["phase"] == "streaming_provider"
+    assert projection["turnId"] == "turn-1"
+    assert projection["model"] == %{"providerId" => "anthropic", "modelId" => "claude-test"}
+    assert projection["metrics"]["own_usage"]["input_tokens_total"] == 4
+
+    assert projection["metrics"]["activeRequest"] == %{
+             "requestId" => "request-1",
+             "status" => "running"
+           }
+
+    assert projection["contextSnapshot"]["active_leaf"] == "leaf-1"
+    assert projection["contextSnapshot"]["context_revision"] == 3
+    assert projection["contextPolicy"]["check_phase"] == "before_provider_dispatch"
+    assert projection["contextPolicy"]["overflow"] == "within_budget"
+    assert projection["watermark"] == 42
+    refute inspect(projection) =~ "#PID"
+  end
+
+  test "runtime snapshot watermarks are monotonic for successive queries" do
+    args = [%{status: :active}, %{phase: :idle, turn_id: nil}, %{}, nil]
+    first = apply(PublicRuntime, :runtime_snapshot, args)
+    second = apply(PublicRuntime, :runtime_snapshot, args)
+    assert second["watermark"] >= first["watermark"]
+  end
+
   defmodule ScriptedProvider do
     @behaviour Sigma.Ai.Provider
 
@@ -11,7 +67,12 @@ defmodule Sigma.Agent.PublicRuntimeTest do
     def stream(params) do
       response = Keyword.get(params.options, :response, "headless response")
       message = message(response, :stop)
-      [{:start, %{message | content: []}}, {:text_delta, 0, response, message}, {:done, :stop, message}]
+
+      [
+        {:start, %{message | content: []}},
+        {:text_delta, 0, response, message},
+        {:done, :stop, message}
+      ]
     end
 
     def message(text, stop_reason) do
@@ -125,7 +186,8 @@ defmodule Sigma.Agent.PublicRuntimeTest do
     {:ok, repo: repo, sessions_dir: sessions_dir}
   end
 
-  test "drives a complete turn through the direct protocol API for two ordered subscribers", context do
+  test "drives a complete turn through the direct protocol API for two ordered subscribers",
+       context do
     session_id = "direct-turn"
     runtime_context = create_session!(context, session_id, provider: ScriptedProvider)
     sub1 = attach!(session_id, runtime_context)
@@ -153,7 +215,133 @@ defmodule Sigma.Agent.PublicRuntimeTest do
     end
   end
 
-  test "subscriber disconnect does not stop a running turn and reconnect receives the terminal event", context do
+  test "subscription attach returns an atomic cursor-zero turn snapshot before updates",
+       context do
+    session_id = "atomic-attach"
+    runtime_context = create_session!(context, session_id, provider: ScriptedProvider)
+    writer = Sigma.Agent.Runtime.lookup(context.repo, session_id, :writer)
+
+    assert {:ok, _entry_id} =
+             Sigma.Session.Writer.append(
+               writer,
+               {:metrics, :request_finished,
+                %{
+                  request_id: "persisted-request",
+                  session_id: session_id,
+                  revision: 1,
+                  status: :completed,
+                  input_tokens_total: 12,
+                  output_tokens_total: 3,
+                  elapsed_ms: 100
+                }}
+             )
+
+    assert {:ok, resume} = Envelope.command("session.resume", session_id)
+
+    assert {:ok, %{payload: %{"metrics" => resumed_metrics}}} =
+             PublicRuntime.execute(resume, runtime_context)
+
+    assert resumed_metrics["schemaVersion"] == 1
+    assert resumed_metrics["ownUsage"]["total_tokens"] == 15
+
+    assert {:ok, command} =
+             Envelope.command("subscription.attach", session_id, %{
+               "requiredCapabilities" => ["metrics.v1"]
+             })
+
+    assert {:ok,
+            %{
+              type: "session.snapshot",
+              payload: %{
+                "subscriptionId" => subscription_id,
+                "cursor" => 0,
+                "watermark" => 0,
+                "protocolVersion" => 1,
+                "enabledCapabilities" => ["metrics.v1"],
+                "turn" => %{"phase" => "idle", "turnId" => nil},
+                "metrics" => attached_metrics
+              }
+            }} = PublicRuntime.execute(command, runtime_context)
+
+    assert attached_metrics == resumed_metrics
+
+    assert {:ok, prompt} = Envelope.command("prompt.submit", session_id, %{"content" => "go"})
+    assert {:ok, _admission} = PublicRuntime.execute(prompt, runtime_context)
+
+    first = receive_type(subscription_id, "prompt.admitted")
+    assert first.payload["cursor"] == 1
+
+    metrics_event = receive_type(subscription_id, "metrics.changed")
+    assert metrics_event.payload["schemaVersion"] == 1
+
+    assert metrics_event.payload["fact"] in [
+             "turn_started",
+             "request_started",
+             "request_finished"
+           ]
+
+    assert Enum.all?(Map.keys(metrics_event.payload["data"]), &is_binary/1)
+    assert {:ok, encoded} = Codec.encode(metrics_event)
+    assert {:ok, ^metrics_event} = Codec.decode(encoded)
+  end
+
+  test "active attach overlays the durable in-flight request at cursor zero", context do
+    session_id = "active-request-attach"
+
+    runtime_context =
+      create_session!(context, session_id,
+        provider: BlockingProvider,
+        options: [test_pid: self()]
+      )
+
+    assert {:ok, prompt} = Envelope.command("prompt.submit", session_id, %{"content" => "wait"})
+    assert {:ok, _admission} = PublicRuntime.execute(prompt, runtime_context)
+    assert_receive {:headless_provider_waiting, provider}, 1_000
+
+    assert {:ok, attach} = Envelope.command("subscription.attach", session_id)
+
+    assert {:ok,
+            %{
+              payload: %{
+                "cursor" => 0,
+                "turn" => %{"currentRequestId" => request_id},
+                "metrics" => durable_metrics,
+                "runtimeSnapshot" => %{
+                  "watermark" => 0,
+                  "metrics" => %{
+                    "activeRequest" => %{"requestId" => request_id, "status" => "running"}
+                  }
+                }
+              }
+            }} = PublicRuntime.execute(attach, runtime_context)
+
+    assert is_binary(request_id)
+    refute Map.has_key?(durable_metrics, "activeRequest")
+
+    assert {:ok, status} =
+             Envelope.command("session.status", session_id, %{
+               "subscriptionId" => attach.payload["subscriptionId"]
+             })
+
+    assert {:ok,
+            %{
+              payload: %{
+                "metrics" => status_metrics,
+                "runtimeSnapshot" => %{
+                  "metrics" => %{
+                    "activeRequest" => %{"requestId" => ^request_id, "status" => "running"}
+                  }
+                }
+              }
+            }} = PublicRuntime.execute(status, runtime_context)
+
+    refute Map.has_key?(status_metrics, "activeRequest")
+
+    send(provider, :release_headless_provider)
+  end
+
+  test "subscriber disconnect does not stop a running turn and reconnect receives the terminal event",
+       context do
     session_id = "disconnect-turn"
 
     runtime_context =
@@ -188,6 +376,7 @@ defmodule Sigma.Agent.PublicRuntimeTest do
     Process.sleep(20)
 
     assert {:ok, status} = Envelope.command("session.status", session_id)
+
     assert {:ok, %{payload: %{"turn" => %{"phase" => "streaming_provider"}}}} =
              PublicRuntime.execute(status, runtime_context)
 
@@ -209,7 +398,8 @@ defmodule Sigma.Agent.PublicRuntimeTest do
 
     subscription_id = attach!(session_id, runtime_context)
 
-    assert {:ok, prompt} = Envelope.command("prompt.submit", session_id, %{"content" => "use tool"})
+    assert {:ok, prompt} =
+             Envelope.command("prompt.submit", session_id, %{"content" => "use tool"})
 
     assert {:ok, _admission} =
              PublicRuntime.execute(prompt, Map.put(runtime_context, :interactive_approvals, true))
@@ -252,7 +442,10 @@ defmodule Sigma.Agent.PublicRuntimeTest do
       )
 
     subscription_id = attach!(session_id, runtime_context)
-    assert {:ok, prompt} = Envelope.command("prompt.submit", session_id, %{"content" => "use tool"})
+
+    assert {:ok, prompt} =
+             Envelope.command("prompt.submit", session_id, %{"content" => "use tool"})
+
     assert {:ok, _admission} = PublicRuntime.execute(prompt, runtime_context)
 
     event = receive_type(subscription_id, "session.error")
@@ -260,7 +453,8 @@ defmodule Sigma.Agent.PublicRuntimeTest do
     refute_receive :safe_tool_executed, 50
   end
 
-  test "a slow subscriber drops intermediate events without blocking the Agent terminal", context do
+  test "a slow subscriber drops intermediate events without blocking the Agent terminal",
+       context do
     session_id = "slow-subscriber"
     runtime_context = create_session!(context, session_id, provider: ScriptedProvider)
     parent = self()
@@ -291,6 +485,269 @@ defmodule Sigma.Agent.PublicRuntimeTest do
              {:sigma_protocol, ^subscription_id, %{type: "turn.completed"}} -> true
              _message -> false
            end)
+  end
+
+  test "subscription cursor preserves a unique snapshot boundary across resync", context do
+    session_id = "cursor-resync"
+    runtime_context = create_session!(context, session_id, provider: ScriptedProvider)
+
+    subscription_context =
+      runtime_context
+      |> Map.put(:subscriber, self())
+      |> Map.put(:max_subscriber_queue, 0)
+
+    subscription_id = attach!(session_id, subscription_context)
+    assert {:ok, prompt} = Envelope.command("prompt.submit", session_id, %{"content" => "gap"})
+    assert {:ok, _admission} = PublicRuntime.execute(prompt, runtime_context)
+
+    events = collect_until(subscription_id, "turn.completed", [])
+    assert Enum.any?(events, &(&1.type == "session.error" and &1.error.code == "resync_required"))
+
+    cursors =
+      events
+      |> Enum.map(& &1.payload["cursor"])
+      |> Enum.filter(&is_integer/1)
+
+    assert cursors == Enum.to_list(1..length(cursors))
+    assert cursors == Enum.uniq(cursors)
+
+    [terminal] = Enum.filter(events, &(&1.type == "turn.completed"))
+    assert terminal.payload["cursor"] == List.last(cursors)
+
+    assert {:ok, status} =
+             Envelope.command("session.status", session_id, %{
+               "subscriptionId" => subscription_id,
+               "requiredCapabilities" => ["subscription.resync.v1"]
+             })
+
+    assert {:ok,
+            %{
+              payload: %{
+                "cursor" => watermark,
+                "watermark" => watermark,
+                "metrics" => %{
+                  "requestCount" => 1,
+                  "ownUsage" => %{"total_tokens" => 2}
+                },
+                "runtimeSnapshot" => %{"watermark" => watermark}
+              }
+            }} = PublicRuntime.execute(status, subscription_context)
+
+    assert watermark == terminal.payload["cursor"]
+  end
+
+  test "resync snapshot restores an active request and converges after terminal", context do
+    session_id = "active-request-resync"
+
+    runtime_context =
+      create_session!(context, session_id,
+        provider: BlockingProvider,
+        options: [test_pid: self()]
+      )
+
+    subscription_context = Map.put(runtime_context, :max_subscriber_queue, 0)
+    subscription_id = attach!(session_id, subscription_context)
+    assert {:ok, prompt} = Envelope.command("prompt.submit", session_id, %{"content" => "wait"})
+    assert {:ok, _admission} = PublicRuntime.execute(prompt, runtime_context)
+    assert_receive {:headless_provider_waiting, provider}, 1_000
+
+    marker = receive_type(subscription_id, "session.error")
+    assert marker.error.code == "resync_required"
+
+    assert {:ok, status} =
+             Envelope.command("session.status", session_id, %{
+               "subscriptionId" => subscription_id
+             })
+
+    assert {:ok,
+            %{
+              payload: %{
+                "cursor" => running_watermark,
+                "metrics" => durable_metrics,
+                "runtimeSnapshot" => %{
+                  "watermark" => running_watermark,
+                  "metrics" => %{
+                    "activeRequest" => %{
+                      "requestId" => request_id,
+                      "status" => "running"
+                    }
+                  }
+                }
+              }
+            }} = PublicRuntime.execute(status, subscription_context)
+
+    refute Map.has_key?(durable_metrics, "activeRequest")
+    assert is_binary(request_id)
+    send(provider, :release_headless_provider)
+    assert :ok = await_phase(context.repo, session_id, :completed, 5_000)
+
+    assert {:ok, terminal_status} =
+             Envelope.command("session.status", session_id, %{
+               "subscriptionId" => subscription_id
+             })
+
+    assert {:ok,
+            %{
+              payload: %{
+                "cursor" => terminal_watermark,
+                "metrics" => %{
+                  "requestCount" => 1,
+                  "ownUsage" => %{"total_tokens" => 2}
+                },
+                "runtimeSnapshot" => %{"metrics" => terminal_metrics}
+              }
+            }} = PublicRuntime.execute(terminal_status, subscription_context)
+
+    assert terminal_watermark >= running_watermark
+    refute Map.has_key?(terminal_metrics, "activeRequest")
+  end
+
+  test "subscription requests resync before a discontinuous metrics revision", context do
+    session_id = "revision-resync"
+    runtime_context = create_session!(context, session_id, provider: ScriptedProvider)
+    subscription_id = attach!(session_id, runtime_context)
+
+    assert [{relay, _sink}] =
+             Registry.lookup(Sigma.Agent.ProtocolSubscriptionRegistry, subscription_id)
+
+    fact = %{
+      request_id: "request-1",
+      session_id: session_id,
+      status: :completed,
+      input_tokens_total: 1,
+      output_tokens_total: 1
+    }
+
+    send(relay, {:metrics, :request_finished, Map.put(fact, :revision, 1)})
+    first = receive_type(subscription_id, "metrics.changed")
+    assert first.payload["cursor"] == 1
+
+    send(relay, {:metrics, :request_usage, Map.put(fact, :revision, 3)})
+    marker = receive_type(subscription_id, "session.error")
+    assert marker.error.code == "resync_required"
+    assert marker.payload["reason"] == "revision_gap"
+    assert marker.payload["expectedRevision"] == 2
+    assert marker.payload["actualRevision"] == 3
+    assert marker.payload["cursor"] == 2
+
+    update = receive_type(subscription_id, "metrics.changed")
+    assert update.payload["cursor"] == 3
+    assert update.payload["data"]["revision"] == 3
+
+    assert {:ok, status} =
+             Envelope.command("session.status", session_id, %{
+               "subscriptionId" => subscription_id,
+               "requiredCapabilities" => ["subscription.resync.v1"]
+             })
+
+    assert {:ok,
+            %{
+              type: "session.snapshot",
+              payload: %{
+                "subscriptionId" => ^subscription_id,
+                "cursor" => 3,
+                "watermark" => 3,
+                "runtimeSnapshot" => %{"watermark" => 3}
+              }
+            }} = PublicRuntime.execute(status, runtime_context)
+
+    next =
+      {:metrics, :request_finished,
+       fact
+       |> Map.put(:request_id, "request-2")
+       |> Map.put(:revision, 1)}
+
+    send(relay, next)
+    assert receive_type(subscription_id, "metrics.changed").payload["cursor"] == 4
+  end
+
+  test "subscription suppresses an identical metrics delivery", context do
+    session_id = "duplicate-metrics"
+    runtime_context = create_session!(context, session_id, provider: ScriptedProvider)
+    subscription_id = attach!(session_id, runtime_context)
+
+    assert [{relay, _sink}] =
+             Registry.lookup(Sigma.Agent.ProtocolSubscriptionRegistry, subscription_id)
+
+    event =
+      {:metrics, :request_finished,
+       %{
+         request_id: "request-1",
+         session_id: session_id,
+         revision: 1,
+         status: :completed,
+         input_tokens_total: 1,
+         output_tokens_total: 1
+       }}
+
+    send(relay, event)
+    send(relay, event)
+
+    delivered = receive_type(subscription_id, "metrics.changed")
+    assert delivered.payload["cursor"] == 1
+    refute_receive {:sigma_protocol, ^subscription_id, %{type: "metrics.changed"}}, 100
+  end
+
+  test "subscription attach rejects unsupported required capabilities", context do
+    session_id = "unsupported-capability"
+    runtime_context = create_session!(context, session_id, provider: ScriptedProvider)
+
+    assert {:ok, command} =
+             Envelope.command("subscription.attach", session_id, %{
+               "requiredCapabilities" => ["future.metrics.v9"]
+             })
+
+    assert {:error,
+            %{
+              error: %{
+                code: "unsupported_capabilities",
+                details: %{
+                  "missing" => ["future.metrics.v9"],
+                  "supported" => supported
+                }
+              }
+            }} = PublicRuntime.execute(command, runtime_context)
+
+    assert "metrics.v1" in supported
+  end
+
+  test "legacy subscription does not receive capability-gated metrics events", context do
+    session_id = "legacy-closed-events"
+    runtime_context = create_session!(context, session_id, provider: ScriptedProvider)
+
+    assert {:ok, command} = Envelope.command("subscription.attach", session_id)
+
+    assert {:ok,
+            %{
+              payload: %{
+                "subscriptionId" => subscription_id,
+                "enabledCapabilities" => []
+              }
+            }} = PublicRuntime.execute(command, runtime_context)
+
+    assert [{relay, _sink}] =
+             Registry.lookup(Sigma.Agent.ProtocolSubscriptionRegistry, subscription_id)
+
+    send(relay, {:metrics, :request_finished, %{request_id: "request-1", revision: 1}})
+    send(relay, {:turn_completed, "turn-1"})
+
+    assert_receive {:sigma_protocol, ^subscription_id,
+                    %{type: "turn.completed", payload: %{"cursor" => 1}}}
+
+    refute_receive {:sigma_protocol, ^subscription_id, %{type: "metrics.changed"}}, 100
+  end
+
+  test "subscription capability negotiation is deterministic", context do
+    session_id = "deduplicated-capabilities"
+    runtime_context = create_session!(context, session_id, provider: ScriptedProvider)
+
+    assert {:ok, command} =
+             Envelope.command("subscription.attach", session_id, %{
+               "requiredCapabilities" => ["metrics.v1", "metrics.v1"]
+             })
+
+    assert {:ok, %{payload: %{"enabledCapabilities" => ["metrics.v1"]}}} =
+             PublicRuntime.execute(command, runtime_context)
   end
 
   test "protocol file commands cannot escape trusted repository roots", context do
@@ -332,6 +789,71 @@ defmodule Sigma.Agent.PublicRuntimeTest do
     refute File.exists?(Path.join(context.sessions_dir, "missing-runtime-options.meta.json"))
   end
 
+  test "protocol fork reuses the command id for duplicate submissions", context do
+    runtime_context = create_session!(context, "protocol-source", [])
+
+    assert {:ok, command} =
+             Envelope.command(
+               "session.fork",
+               "protocol-source",
+               %{
+                 "targetSessionId" => "protocol-fork",
+                 "expectedSourceRevision" => 1,
+                 "expectedSourceLeaf" => nil
+               },
+               id: "operation-fork-1"
+             )
+
+    assert {:ok, %{type: "session.snapshot"}} = PublicRuntime.execute(command, runtime_context)
+    assert {:ok, %{type: "session.snapshot"}} = PublicRuntime.execute(command, runtime_context)
+  end
+
+  test "protocol retry executes from the selected turn checkpoint", context do
+    session_id = "protocol-retry"
+    runtime_context = create_session!(context, session_id, provider: ScriptedProvider)
+
+    assert {:ok, first_command} =
+             Envelope.command("prompt.submit", session_id, %{"content" => "first"})
+
+    assert {:ok, %{payload: first_admission}} =
+             PublicRuntime.execute(first_command, runtime_context)
+
+    assert :ok = await_phase(context.repo, session_id, :completed, 5_000)
+
+    assert {:ok, second_command} =
+             Envelope.command("prompt.submit", session_id, %{"content" => "second"})
+
+    assert {:ok, _event} = PublicRuntime.execute(second_command, runtime_context)
+    assert :ok = await_phase(context.repo, session_id, :completed, 5_000)
+
+    path = Path.join(context.sessions_dir, "#{session_id}.jsonl")
+    assert {:ok, before} = Sigma.Session.Log.snapshot(path)
+
+    assert {:ok, retry_command} =
+             Envelope.command(
+               "session.retry",
+               session_id,
+               %{
+                 "messageId" => first_admission["messageId"],
+                 "expectedSourceRevision" => length(before.branch_entry_ids) + 1,
+                 "expectedSourceLeaf" => before.active_leaf_id
+               },
+               id: "retry-command-1"
+             )
+
+    assert {:ok, %{payload: %{"retry" => retry}}} =
+             PublicRuntime.execute(retry_command, runtime_context)
+
+    assert retry["status"] == "accepted"
+    assert retry["retryOfTurnId"] == first_admission["turnId"]
+    assert retry["turnId"] != first_admission["turnId"]
+
+    assert {:ok, %{payload: %{"retry" => duplicate}}} =
+             PublicRuntime.execute(retry_command, runtime_context)
+
+    assert duplicate == retry
+  end
+
   defp create_session!(context, session_id, session_opts) do
     runtime_context = %{
       repo_path: context.repo,
@@ -357,7 +879,11 @@ defmodule Sigma.Agent.PublicRuntimeTest do
   end
 
   defp attach!(session_id, context) do
-    assert {:ok, command} = Envelope.command("subscription.attach", session_id)
+    assert {:ok, command} =
+             Envelope.command("subscription.attach", session_id, %{
+               "requiredCapabilities" => ["metrics.v1"]
+             })
+
     assert {:ok, %{payload: %{"subscriptionId" => subscription_id}}} =
              PublicRuntime.execute(command, context)
 
@@ -377,7 +903,10 @@ defmodule Sigma.Agent.PublicRuntimeTest do
     receive do
       {:sigma_protocol, ^subscription_id, event} ->
         events = acc ++ [event]
-        if event.type == terminal_type, do: events, else: collect_until(subscription_id, terminal_type, events)
+
+        if event.type == terminal_type,
+          do: events,
+          else: collect_until(subscription_id, terminal_type, events)
     after
       5_000 -> flunk("timed out waiting for #{terminal_type}")
     end

@@ -11,6 +11,46 @@ defmodule Sigma.Agent.PublicRuntime do
   alias Sigma.Agent.{ProtocolEventMapper, ProtocolSubscription, Runtime}
   alias Sigma.Protocol.Envelope
 
+  @doc """
+  Builds the bounded runtime/session projection shared by protocol clients.
+
+  The projection deliberately accepts already-read status values and a durable
+  session snapshot so callers can use it without exposing runtime process terms.
+  A supplied `watermark` is the owning subscription's cursor. Without one, the
+  projection uses a process-local monotonic query marker; neither is persisted.
+  """
+  def runtime_snapshot(runtime_status, turn_status, session_snapshot, watermark \\ nil)
+      when is_map(runtime_status) and is_map(turn_status) and is_map(session_snapshot) do
+    metrics = Map.get(session_snapshot, :metrics) || Map.get(session_snapshot, "metrics")
+    watermark = watermark || System.monotonic_time(:microsecond)
+
+    %{
+      "phase" =>
+        public_atom(Map.get(turn_status, :phase) || Map.get(turn_status, "phase"), "stopped"),
+      "turnId" => Map.get(turn_status, :turn_id) || Map.get(turn_status, "turnId"),
+      "model" => %{
+        "providerId" =>
+          Map.get(session_snapshot, :provider_id) || Map.get(session_snapshot, "providerId"),
+        "modelId" => Map.get(session_snapshot, :model_id) || Map.get(session_snapshot, "modelId")
+      },
+      "sessionStatus" =>
+        public_atom(
+          Map.get(runtime_status, :status) || Map.get(runtime_status, "status"),
+          "unknown"
+        ),
+      "metrics" => runtime_metrics(metrics, turn_status),
+      "contextSnapshot" =>
+        ProtocolEventMapper.public_value(
+          Map.get(turn_status, :context_snapshot) || Map.get(turn_status, "contextSnapshot")
+        ),
+      "contextPolicy" =>
+        ProtocolEventMapper.public_value(
+          Map.get(turn_status, :context_policy) || Map.get(turn_status, "contextPolicy")
+        ),
+      "watermark" => watermark
+    }
+  end
+
   def execute(command, context \\ %{})
 
   def execute(%Envelope{kind: :command} = command, context) when is_map(context) do
@@ -46,11 +86,15 @@ defmodule Sigma.Agent.PublicRuntime do
              cwd,
              initial_model_opts(command.payload)
            ]) do
-      result = resume(command, Map.put(context, :session_opts, session_opts), repo_path, storage_path)
+      result =
+        resume(command, Map.put(context, :session_opts, session_opts), repo_path, storage_path)
 
       case result do
-        {:ok, _event} -> result
-        {:error, _reason} = error -> rollback_failed_create(sessions_dir, command.session_id, error)
+        {:ok, _event} ->
+          result
+
+        {:error, _reason} = error ->
+          rollback_failed_create(sessions_dir, command.session_id, error)
       end
     end
   end
@@ -63,28 +107,24 @@ defmodule Sigma.Agent.PublicRuntime do
   end
 
   defp dispatch(%Envelope{type: "session.status"} = command, context) do
-    with {:ok, repo_path, sessions_dir} <- paths(command, context),
-         {:ok, storage_path} <- session_path(sessions_dir, command.session_id),
-         {:ok, snapshot} <- apply(Sigma.Session.Log, :snapshot, [storage_path]) do
-      runtime_status = Runtime.session_status(repo_path, command.session_id)
-      agent_status = agent_status(repo_path, command.session_id)
-
-      snapshot_event(command.session_id, snapshot, %{
-        "runtime" => public_runtime_status(runtime_status),
-        "turn" => agent_status
-      })
+    with :ok <- validate_capabilities(command),
+         {:ok, repo_path, sessions_dir} <- paths(command, context),
+         {:ok, storage_path} <- session_path(sessions_dir, command.session_id) do
+      status_snapshot(command, context, repo_path, storage_path)
     end
   end
 
   defp dispatch(%Envelope{type: "session.switch"} = command, context) do
     with {:ok, repo_path, sessions_dir} <- paths(command, context),
-         target_id when is_binary(target_id) and target_id != "" <- command.payload["targetSessionId"],
+         target_id when is_binary(target_id) and target_id != "" <-
+           command.payload["targetSessionId"],
          {:ok, %{snapshot: snapshot}} <-
            Runtime.switch_session(
              repo_path,
              command.session_id,
              target_id,
-             sessions_dir
+             sessions_dir,
+             operation_opts(command)
            ),
          {:ok, target_path} <- session_path(sessions_dir, target_id),
          {:ok, target_command} <- Envelope.command("session.resume", target_id),
@@ -99,7 +139,8 @@ defmodule Sigma.Agent.PublicRuntime do
 
   defp dispatch(%Envelope{type: "session.fork"} = command, context) do
     with {:ok, repo_path, sessions_dir} <- paths(command, context),
-         target_id when is_binary(target_id) and target_id != "" <- command.payload["targetSessionId"],
+         target_id when is_binary(target_id) and target_id != "" <-
+           command.payload["targetSessionId"],
          {:ok, %{session_id: ^target_id}} <-
            Runtime.fork_session(
              repo_path,
@@ -107,7 +148,7 @@ defmodule Sigma.Agent.PublicRuntime do
              target_id,
              sessions_dir,
              command.payload["messageId"] || :all,
-             fallback_cwd: repo_path
+             Keyword.merge([fallback_cwd: repo_path], operation_opts(command))
            ),
          {:ok, target_path} <- session_path(sessions_dir, target_id),
          {:ok, snapshot} <- apply(Sigma.Session.Log, :snapshot, [target_path]) do
@@ -115,6 +156,42 @@ defmodule Sigma.Agent.PublicRuntime do
     else
       nil -> {:error, :missing_target_session_id}
       false -> {:error, :missing_target_session_id}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp dispatch(%Envelope{type: "session.retry"} = command, context) do
+    with {:ok, repo_path, sessions_dir} <- paths(command, context),
+         message_id when is_binary(message_id) and message_id != "" <-
+           command.payload["messageId"],
+         {:ok, result} <-
+           Runtime.retry_turn(
+             repo_path,
+             command.session_id,
+             sessions_dir,
+             message_id,
+             operation_opts(command)
+           ),
+         {:ok, event} <-
+           Envelope.event(
+             "session.snapshot",
+             command.session_id,
+             %{
+               "retry" => %{
+                 "status" => "accepted",
+                 "messageId" => result.message_id,
+                 "turnId" => result.turn_id,
+                 "retryOfTurnId" => result.retry_of_turn_id,
+                 "sourceEntryId" => result.source_entry_id,
+                 "checkpointEntryId" => result.checkpoint_entry_id
+               }
+             },
+             turn_id: result.turn_id
+           ) do
+      {:ok, event}
+    else
+      nil -> {:error, :missing_message_id}
+      false -> {:error, :missing_message_id}
       {:error, _reason} = error -> error
     end
   end
@@ -201,17 +278,44 @@ defmodule Sigma.Agent.PublicRuntime do
   defp dispatch(%Envelope{type: "subscription.attach"} = command, context) do
     sink = context[:subscriber] || self()
 
-    with true <- is_pid(sink),
+    with {:ok, capabilities} <- negotiate_capabilities(command),
+         true <- is_pid(sink),
+         {:ok, repo_path, sessions_dir} <- paths(command, context),
+         {:ok, storage_path} <- session_path(sessions_dir, command.session_id),
          {:ok, agent} <- running_agent(command, context),
-         {:ok, subscription_id} <-
-           ProtocolSubscription.attach(agent, command.session_id, sink,
-             max_sink_queue: context[:max_subscriber_queue] || 256
+         {:ok, subscription_id, cursor, turn_snapshot, session_snapshot} <-
+           ProtocolSubscription.attach_snapshot(agent, command.session_id, sink,
+             max_sink_queue: context[:max_subscriber_queue] || 256,
+             capabilities: capabilities,
+             snapshot_loader: fn -> apply(Sigma.Session.Log, :snapshot, [storage_path]) end
            ),
          {:ok, event} <-
-           Envelope.event("session.snapshot", command.session_id, %{
-             "subscriptionId" => subscription_id,
-             "attached" => true
-           }) do
+           Envelope.event(
+             "session.snapshot",
+             command.session_id,
+             session_snapshot
+             |> ProtocolEventMapper.snapshot_payload(command.session_id)
+             |> Map.merge(%{
+               "subscriptionId" => subscription_id,
+               "attached" => true,
+               "enabledCapabilities" => capabilities,
+               "cursor" => cursor,
+               "watermark" => cursor,
+               "turn" => public_turn_snapshot(turn_snapshot),
+               "metrics" =>
+                 ProtocolEventMapper.metrics_snapshot(
+                   session_snapshot.metrics,
+                   command.session_id
+                 ),
+               "runtimeSnapshot" =>
+                 runtime_snapshot(
+                   Runtime.session_status(repo_path, command.session_id),
+                   turn_snapshot,
+                   session_snapshot,
+                   cursor
+                 )
+             })
+           ) do
       {:ok, event}
     else
       false -> {:error, :subscriber_required}
@@ -282,6 +386,9 @@ defmodule Sigma.Agent.PublicRuntime do
       {:ok,
        opts
        |> Keyword.put(:messages, snapshot.messages)
+       |> Keyword.put(:active_leaf, Map.get(snapshot, :active_leaf_id))
+       |> Keyword.put(:context_revision, length(Map.get(snapshot, :branch_entry_ids, [])))
+       |> Keyword.put(:context_source, :journal_replay)
        |> Keyword.put(:cwd, opts[:cwd] || snapshot.cwd || repo_path)
        |> Keyword.put(:transcript_path, storage_path)}
     else
@@ -310,7 +417,9 @@ defmodule Sigma.Agent.PublicRuntime do
 
   defp call_prompt(agent, :submit, content, opts), do: Sigma.Agent.prompt(agent, content, opts)
   defp call_prompt(agent, :steer, content, opts), do: Sigma.Agent.steer(agent, content, opts)
-  defp call_prompt(agent, :follow_up, content, opts), do: Sigma.Agent.follow_up(agent, content, opts)
+
+  defp call_prompt(agent, :follow_up, content, opts),
+    do: Sigma.Agent.follow_up(agent, content, opts)
 
   defp prompt_opts(context, agent) do
     permission_resolver =
@@ -328,7 +437,10 @@ defmodule Sigma.Agent.PublicRuntime do
   end
 
   defp maybe_put_resolver(opts, _key, nil), do: opts
-  defp maybe_put_resolver(opts, key, resolver) when is_function(resolver), do: Keyword.put(opts, key, resolver)
+
+  defp maybe_put_resolver(opts, key, resolver) when is_function(resolver),
+    do: Keyword.put(opts, key, resolver)
+
   defp maybe_put_resolver(opts, _key, _resolver), do: opts
 
   defp request_tool_permission(agent, tool_call) do
@@ -360,7 +472,7 @@ defmodule Sigma.Agent.PublicRuntime do
 
   defp cancel_payload({status, turn_id})
        when status in [:cancelling, :already_cancelling, :already_cancelled],
-    do: {:ok, %{"status" => Atom.to_string(status), "turnId" => turn_id}}
+       do: {:ok, %{"status" => Atom.to_string(status), "turnId" => turn_id}}
 
   defp cancel_payload({:error, reason}), do: {:error, reason}
   defp cancel_payload(_result), do: {:error, :invalid_cancel_result}
@@ -409,12 +521,122 @@ defmodule Sigma.Agent.PublicRuntime do
 
   defp status_event(_session_id, _agent), do: {:error, :session_not_running}
 
+  defp operation_opts(%Envelope{} = command) do
+    operation_id = command.payload["operationId"] || command.id
+
+    opts =
+      if is_binary(operation_id) and operation_id != "",
+        do: [operation_id: operation_id],
+        else: []
+
+    opts
+    |> maybe_operation_opt(:expected_source_revision, command.payload["expectedSourceRevision"])
+    |> maybe_operation_opt_present(
+      :expected_source_leaf,
+      command.payload,
+      "expectedSourceLeaf"
+    )
+    |> maybe_operation_opt(:provider_id, command.payload["providerId"])
+    |> maybe_operation_opt(:model_id, command.payload["modelId"])
+  end
+
+  defp maybe_operation_opt(opts, _key, nil), do: opts
+
+  defp maybe_operation_opt(opts, key, value) when is_integer(value) or is_binary(value),
+    do: Keyword.put(opts, key, value)
+
+  defp maybe_operation_opt(opts, _key, _value), do: opts
+
+  defp maybe_operation_opt_present(opts, key, payload, payload_key) do
+    if Map.has_key?(payload, payload_key) do
+      Keyword.put(opts, key, Map.get(payload, payload_key))
+    else
+      opts
+    end
+  end
+
   defp snapshot_event(session_id, snapshot, extra \\ %{}) do
-    payload = Map.merge(ProtocolEventMapper.snapshot_payload(snapshot), extra)
+    payload = Map.merge(ProtocolEventMapper.snapshot_payload(snapshot, session_id), extra)
 
     case Envelope.event("session.snapshot", session_id, payload) do
       {:ok, event} -> {:ok, event}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp status_snapshot(command, context, repo_path, storage_path) do
+    case command.payload["subscriptionId"] do
+      subscription_id when is_binary(subscription_id) and subscription_id != "" ->
+        sink = context[:subscriber] || self()
+
+        with true <- is_pid(sink),
+             {:ok, cursor, turn_snapshot, snapshot} <-
+               ProtocolSubscription.snapshot(subscription_id, sink, fn ->
+                 apply(Sigma.Session.Log, :snapshot, [storage_path])
+               end) do
+          runtime_status = Runtime.session_status(repo_path, command.session_id)
+          turn = public_turn_snapshot(turn_snapshot)
+
+          snapshot_event(command.session_id, snapshot, %{
+            "subscriptionId" => subscription_id,
+            "cursor" => cursor,
+            "watermark" => cursor,
+            "runtime" => public_runtime_status(runtime_status),
+            "turn" => turn,
+            "metrics" =>
+              ProtocolEventMapper.metrics_snapshot(snapshot.metrics, command.session_id),
+            "runtimeSnapshot" => runtime_snapshot(runtime_status, turn_snapshot, snapshot, cursor)
+          })
+        else
+          false -> {:error, :subscriber_required}
+          {:error, _reason} = error -> error
+        end
+
+      _subscription_id ->
+        with {:ok, snapshot} <- apply(Sigma.Session.Log, :snapshot, [storage_path]) do
+          runtime_status = Runtime.session_status(repo_path, command.session_id)
+          turn = agent_status(repo_path, command.session_id)
+
+          snapshot_event(command.session_id, snapshot, %{
+            "runtime" => public_runtime_status(runtime_status),
+            "turn" => turn,
+            "runtimeSnapshot" => runtime_snapshot(runtime_status, turn, snapshot)
+          })
+        end
+    end
+  end
+
+  defp validate_capabilities(%Envelope{payload: payload}) do
+    case negotiate_capabilities(payload) do
+      {:ok, _capabilities} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp negotiate_capabilities(%Envelope{payload: payload}), do: negotiate_capabilities(payload)
+
+  defp negotiate_capabilities(payload) do
+    case payload["requiredCapabilities"] do
+      nil ->
+        {:ok, []}
+
+      capabilities when is_list(capabilities) ->
+        if Enum.all?(capabilities, &(is_binary(&1) and &1 != "")) do
+          capabilities = Enum.uniq(capabilities)
+          missing = capabilities -- Envelope.capabilities()
+
+          if missing == [] do
+            {:ok, capabilities}
+          else
+            {:error,
+             {:unsupported_capabilities, %{missing: missing, supported: Envelope.capabilities()}}}
+          end
+        else
+          {:error, :invalid_protocol_capabilities}
+        end
+
+      _capabilities ->
+        {:error, :invalid_protocol_capabilities}
     end
   end
 
@@ -504,9 +726,16 @@ defmodule Sigma.Agent.PublicRuntime do
   defp agent_status(agent) do
     status = Sigma.Agent.status(agent)
 
+    public_turn_snapshot(status)
+  end
+
+  defp public_turn_snapshot(status) do
     %{
       "phase" => Atom.to_string(status.phase),
       "turnId" => status.turn_id,
+      "currentRequestId" => status.current_request_id,
+      "contextSnapshot" => ProtocolEventMapper.public_value(status.context_snapshot),
+      "contextPolicy" => ProtocolEventMapper.public_value(status.context_policy),
       "steeringQueueCount" => status.steering_queue_count,
       "followUpQueueCount" => status.follow_up_queue_count
     }
@@ -518,6 +747,28 @@ defmodule Sigma.Agent.PublicRuntime do
       "messageCount" => Map.get(status, :message_count),
       "eventCount" => Map.get(status, :event_count)
     }
+  end
+
+  defp public_atom(value, _default) when is_binary(value), do: value
+  defp public_atom(value, _default) when is_atom(value), do: Atom.to_string(value)
+  defp public_atom(_value, default), do: default
+
+  defp runtime_metrics(nil, _turn_status), do: nil
+
+  defp runtime_metrics(metrics, turn_status) do
+    projection = ProtocolEventMapper.public_value(metrics)
+
+    request_id =
+      Map.get(turn_status, :current_request_id) || Map.get(turn_status, "currentRequestId")
+
+    if is_binary(request_id) and request_id != "" do
+      Map.put(projection, "activeRequest", %{
+        "requestId" => request_id,
+        "status" => "running"
+      })
+    else
+      projection
+    end
   end
 
   defp error_event(command, reason) do

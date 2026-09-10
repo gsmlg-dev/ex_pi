@@ -98,6 +98,19 @@ defmodule Sigma.Agent.Runtime do
     )
   end
 
+  @doc "Retries a persisted user turn from its original checkpoint on a new branch."
+  def retry_turn(repo_path, session_id, sessions_dir, message_id, opts \\ [])
+      when is_binary(repo_path) and is_binary(session_id) and is_binary(sessions_dir) and
+             is_binary(message_id) do
+    session_operation(repo_path, session_id, {:retry, sessions_dir, message_id, opts})
+  end
+
+  @doc "Compacts an idle session through the repository-owned operation boundary."
+  def compact_session(repo_path, session_id, sessions_dir, opts \\ [])
+      when is_binary(repo_path) and is_binary(session_id) and is_binary(sessions_dir) do
+    session_operation(repo_path, session_id, {:compact, sessions_dir, opts})
+  end
+
   @doc "Relocates an idle session file set through the serialized operation boundary."
   def adopt_session(
         repo_path,
@@ -117,15 +130,15 @@ defmodule Sigma.Agent.Runtime do
     )
   end
 
-  def rename_session(repo_path, session_id, target_session_id, sessions_dir)
+  def rename_session(repo_path, session_id, target_session_id, sessions_dir, opts \\ [])
       when is_binary(repo_path) and is_binary(session_id) and is_binary(target_session_id) and
              is_binary(sessions_dir) do
-    session_operation(repo_path, session_id, {:rename, target_session_id, sessions_dir, []})
+    session_operation(repo_path, session_id, {:rename, target_session_id, sessions_dir, opts})
   end
 
-  def delete_session(repo_path, session_id, sessions_dir)
+  def delete_session(repo_path, session_id, sessions_dir, opts \\ [])
       when is_binary(repo_path) and is_binary(session_id) and is_binary(sessions_dir) do
-    session_operation(repo_path, session_id, {:delete, sessions_dir, []})
+    session_operation(repo_path, session_id, {:delete, sessions_dir, opts})
   end
 
   @doc """
@@ -212,7 +225,8 @@ defmodule Sigma.Agent.Runtime do
 
   defp ensure_runtime_processes_started do
     with registry_pid when is_pid(registry_pid) <- Process.whereis(Sigma.Agent.RepositoryRegistry),
-         supervisor_pid when is_pid(supervisor_pid) <- Process.whereis(Sigma.Agent.DynamicSupervisor) do
+         supervisor_pid when is_pid(supervisor_pid) <-
+           Process.whereis(Sigma.Agent.DynamicSupervisor) do
       _ = {registry_pid, supervisor_pid}
       :ok
     else

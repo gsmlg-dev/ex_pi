@@ -36,6 +36,42 @@ defmodule Sigma.Agent.RuntimeTest do
     end
   end
 
+  defmodule ManualCompactionProvider do
+    @behaviour Sigma.Ai.Provider
+
+    @impl true
+    def stream(%{purpose: :compaction}) do
+      message = %{
+        role: :assistant,
+        content: [%{type: :text, text: "Manual summary"}],
+        model: "mock-model",
+        provider: "mock-provider",
+        usage: %{input: 20, output: 3, total_tokens: 23},
+        stop_reason: :stop,
+        timestamp: System.system_time(:millisecond)
+      }
+
+      [{:start, %{message | content: []}}, {:done, :stop, message}]
+    end
+  end
+
+  defmodule FailOperationTerminalStorage do
+    @behaviour Sigma.Session.Storage
+
+    @impl true
+    def append(_path, %{"type" => "metrics", "fact" => "operation_finished"}),
+      do: {:error, :terminal_write_failed}
+
+    def append(path, entry), do: Sigma.Session.Storage.JsonlFile.append(path, entry)
+
+    @impl true
+    def read(path), do: Sigma.Session.Storage.JsonlFile.read(path)
+
+    @impl true
+    def read_with_diagnostics(path),
+      do: Sigma.Session.Storage.JsonlFile.read_with_diagnostics(path)
+  end
+
   setup context do
     tmp_dir =
       Path.join([
@@ -93,7 +129,8 @@ defmodule Sigma.Agent.RuntimeTest do
     supervisor
     |> Supervisor.which_children()
     |> Enum.find_value(false, fn
-      {Sigma.Agent.RepositoryProcess, pid, :worker, [Sigma.Agent.RepositoryProcess]} when is_pid(pid) ->
+      {Sigma.Agent.RepositoryProcess, pid, :worker, [Sigma.Agent.RepositoryProcess]}
+      when is_pid(pid) ->
         %{repo_path: repo_path} = Sigma.Agent.RepositoryProcess.status(pid)
         String.starts_with?(repo_path, tmp_dir)
 
@@ -141,10 +178,14 @@ defmodule Sigma.Agent.RuntimeTest do
     assert handle_a.session != handle_b.session
     assert handle_a.agent != handle_b.agent
 
-    assert %{repo_path: ^repo_a, sessions: sessions_a} = Sigma.Agent.Runtime.repository_status(repo_a)
+    assert %{repo_path: ^repo_a, sessions: sessions_a} =
+             Sigma.Agent.Runtime.repository_status(repo_a)
+
     assert Map.has_key?(sessions_a, "session-a")
 
-    assert %{repo_path: ^repo_b, sessions: sessions_b} = Sigma.Agent.Runtime.repository_status(repo_b)
+    assert %{repo_path: ^repo_b, sessions: sessions_b} =
+             Sigma.Agent.Runtime.repository_status(repo_b)
+
     assert Map.has_key?(sessions_b, "session-b")
   end
 
@@ -428,7 +469,8 @@ defmodule Sigma.Agent.RuntimeTest do
     assert %{event_count: 2} = Sigma.Agent.SessionProcess.status(handle.session)
   end
 
-  test "runtime rejects switch and fork while the source turn is busy without mutation", context do
+  test "runtime rejects switch and fork while the source turn is busy without mutation",
+       context do
     repo = tmp_repo!(context, "repo-operations-busy")
     sessions_dir = Path.join(repo, "sessions")
     File.mkdir_p!(sessions_dir)
@@ -456,6 +498,7 @@ defmodule Sigma.Agent.RuntimeTest do
     assert {:accepted, _admission} = Sigma.Agent.prompt(handle.agent, "stay busy")
     assert_receive {:runtime_provider_waiting, _provider}, 1_000
     source_before = File.read!(source_path)
+    mutation_opts = mutation_opts(source_path, "busy-fork")
 
     assert {:error, :session_busy} =
              Sigma.Agent.Runtime.switch_session(
@@ -466,7 +509,22 @@ defmodule Sigma.Agent.RuntimeTest do
              )
 
     assert {:error, :session_busy} =
-             Sigma.Agent.Runtime.fork_session(repo, "source", "fork", sessions_dir)
+             Sigma.Agent.Runtime.fork_session(
+               repo,
+               "source",
+               "fork",
+               sessions_dir,
+               :all,
+               mutation_opts
+             )
+
+    assert {:error, :session_busy} =
+             Sigma.Agent.Runtime.compact_session(
+               repo,
+               "source",
+               sessions_dir,
+               Keyword.put(mutation_opts, :operation_id, "busy-compact")
+             )
 
     assert {:error, :session_busy} =
              Sigma.Agent.Runtime.adopt_session(
@@ -483,7 +541,66 @@ defmodule Sigma.Agent.RuntimeTest do
     refute File.exists?(Path.join(adopted_sessions_dir, "source.jsonl"))
   end
 
-  test "idle runtime switch validates restored state and failed targets leave the source usable", context do
+  test "manual compaction is durable, leaf-audited, and idempotent", context do
+    repo = tmp_repo!(context, "repo-manual-compact")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+
+    for index <- 1..22 do
+      message =
+        if rem(index, 2) == 1,
+          do: Sigma.Agent.Message.user("m#{index}", "user #{index}"),
+          else: Sigma.Agent.Message.assistant("m#{index}", %{content: "assistant #{index}"})
+
+      :ok = Sigma.Session.Log.persist_event(source_path, {:message_end, message})
+    end
+
+    assert {:ok, before} = Sigma.Session.Log.snapshot(source_path)
+
+    assert {:ok, _handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(
+                 cwd: repo,
+                 transcript_path: source_path,
+                 messages: before.messages,
+                 provider: ManualCompactionProvider
+               )
+             )
+
+    opts = [
+      operation_id: "manual-compact-1",
+      expected_source_revision: length(before.branch_entry_ids) + 1,
+      expected_source_leaf: before.active_leaf_id
+    ]
+
+    assert {:ok, result} =
+             Sigma.Agent.Runtime.compact_session(repo, "source", sessions_dir, opts)
+
+    assert result.source_leaf_id == before.active_leaf_id
+    assert is_binary(result.compaction_id)
+    assert is_binary(result.summary_id)
+
+    assert {:ok, duplicate} =
+             Sigma.Agent.Runtime.compact_session(repo, "source", sessions_dir, opts)
+
+    assert duplicate == result
+    assert {:ok, snapshot} = Sigma.Session.Log.snapshot(source_path)
+
+    assert snapshot.metrics.compactions[result.compaction_id].source_leaf_id ==
+             before.active_leaf_id
+
+    assert Enum.count(snapshot.metrics.compactions, fn {_id, fact} ->
+             fact.trigger in [:manual, "manual"] and fact.status == :committed
+           end) == 1
+  end
+
+  test "idle runtime switch validates restored state and failed targets leave the source usable",
+       context do
     repo = tmp_repo!(context, "repo-operations-switch")
     sessions_dir = Path.join(repo, "sessions")
     File.mkdir_p!(sessions_dir)
@@ -529,6 +646,8 @@ defmodule Sigma.Agent.RuntimeTest do
     repo = tmp_repo!(context, "repo-operations-fork")
     sessions_dir = Path.join(repo, "sessions")
     File.mkdir_p!(sessions_dir)
+    workspace_file = Path.join(repo, "workspace-sentinel.txt")
+    File.write!(workspace_file, "user workspace remains unchanged")
     source_path = Path.join(sessions_dir, "source.jsonl")
     target_path = Path.join(sessions_dir, "fork.jsonl")
 
@@ -541,16 +660,25 @@ defmodule Sigma.Agent.RuntimeTest do
                session_opts(cwd: repo, transcript_path: source_path)
              )
 
-    message = Sigma.Agent.Message.user("persisted-before-fork", "accepted")
-    :ok = Sigma.Agent.SessionProcess.record_event(handle.session, {:message_end, message}, nil)
+    user = Sigma.Agent.Message.user("persisted-before-fork", "accepted")
+    assistant = Sigma.Agent.Message.assistant("completed-before-fork", %{content: "done"})
+    :ok = Sigma.Agent.SessionProcess.record_event(handle.session, {:message_end, user}, nil)
+    :ok = Sigma.Agent.SessionProcess.record_event(handle.session, {:message_end, assistant}, nil)
     source_before = File.read!(source_path)
+    opts = mutation_opts(source_path, "idle-fork")
 
     assert {:ok, %{session_id: "fork"}} =
-             Sigma.Agent.Runtime.fork_session(repo, "source", "fork", sessions_dir)
+             Sigma.Agent.Runtime.fork_session(repo, "source", "fork", sessions_dir, :all, opts)
 
-    assert File.read!(source_path) == source_before
+    assert String.starts_with?(File.read!(source_path), source_before)
     assert {:ok, fork_snapshot} = Sigma.Session.Log.snapshot(target_path)
-    assert Enum.map(fork_snapshot.messages, & &1.id) == ["persisted-before-fork"]
+
+    assert Enum.map(fork_snapshot.messages, & &1.id) == [
+             "persisted-before-fork",
+             "completed-before-fork"
+           ]
+
+    assert File.read!(workspace_file) == "user workspace remains unchanged"
 
     fork_message = Sigma.Agent.Message.user("fork-only", "independent")
     :ok = Sigma.Session.Log.persist_event(target_path, {:message_end, fork_message})
@@ -558,7 +686,652 @@ defmodule Sigma.Agent.RuntimeTest do
     refute Enum.any?(source_snapshot.messages, &(&1.id == "fork-only"))
   end
 
-  test "session operation lock atomically rejects prompt admission until transition completes", context do
+  test "repository operation ids make completed forks idempotent", context do
+    repo = tmp_repo!(context, "repo-operations-idempotent")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+    target_path = Path.join(sessions_dir, "fork.jsonl")
+
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+
+    assert {:ok, handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(cwd: repo, transcript_path: source_path)
+             )
+
+    operation_id = "fork-request-1"
+    opts = mutation_opts(source_path, operation_id)
+
+    assert {:ok, %{session_id: "fork"}} =
+             Sigma.Agent.Runtime.fork_session(repo, "source", "fork", sessions_dir, :all, opts)
+
+    marker = Sigma.Agent.Message.user("fork-only", "independent")
+    :ok = Sigma.Session.Log.persist_event(target_path, {:message_end, marker})
+
+    Process.exit(handle.repository, :kill)
+    assert :ok = await_repository_restarted(repo, handle.repository, 1_000)
+
+    assert {:ok, %{session_id: "fork"}} =
+             Sigma.Agent.Runtime.fork_session(repo, "source", "fork", sessions_dir, :all, opts)
+
+    assert {:error, :operation_conflict} =
+             Sigma.Agent.Runtime.fork_session(repo, "source", "other", sessions_dir, :all, opts)
+
+    assert {:ok, snapshot} = Sigma.Session.Log.snapshot(target_path)
+    assert Enum.any?(snapshot.messages, &(&1.id == "fork-only"))
+  end
+
+  test "concurrent clients with the same fork operation id observe one result", context do
+    repo = tmp_repo!(context, "repo-concurrent-fork-idempotency")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+    target_path = Path.join(sessions_dir, "fork.jsonl")
+
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+
+    :ok =
+      Sigma.Session.Log.persist_event(
+        source_path,
+        {:message_end, Sigma.Agent.Message.user("source-message", "source")}
+      )
+
+    :ok =
+      Sigma.Session.Log.persist_event(
+        source_path,
+        {:message_end, Sigma.Agent.Message.assistant("source-answer", %{content: "done"})}
+      )
+
+    assert {:ok, _handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(cwd: repo, transcript_path: source_path)
+             )
+
+    opts = mutation_opts(source_path, "concurrent-fork-1")
+    parent = self()
+
+    submissions =
+      for _client <- 1..2 do
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :submit ->
+              Sigma.Agent.Runtime.fork_session(
+                repo,
+                "source",
+                "fork",
+                sessions_dir,
+                :all,
+                opts
+              )
+          end
+        end)
+      end
+
+    submitters =
+      for _client <- 1..2 do
+        assert_receive {:ready, submitter}, 1_000
+        submitter
+      end
+
+    Enum.each(submitters, &send(&1, :submit))
+
+    assert [{:ok, first_result}, {:ok, second_result}] =
+             Enum.map(submissions, &Task.await(&1, 5_000))
+
+    assert first_result == second_result
+    result = first_result
+    assert result.session_id == "fork"
+    assert File.exists?(target_path)
+
+    assert {:ok, operation_results} = Sigma.Session.Log.operation_results(source_path)
+
+    assert [completed] =
+             Enum.filter(operation_results, fn result ->
+               (result[:operation_id] || result["operation_id"]) == "concurrent-fork-1"
+             end)
+
+    assert (completed[:status] || completed["status"]) == :completed
+  end
+
+  test "repository restart replays a failed operation without executing it again", context do
+    repo = tmp_repo!(context, "repo-operations-failed-idempotent")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+    target_path = Path.join(sessions_dir, "occupied.jsonl")
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+    :ok = Sigma.Session.Log.persist_event(target_path, {:agent_start, repo})
+
+    assert {:ok, handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(cwd: repo, transcript_path: source_path)
+             )
+
+    opts = mutation_opts(source_path, "failed-fork-1")
+
+    assert {:error, :already_exists} =
+             Sigma.Agent.Runtime.fork_session(
+               repo,
+               "source",
+               "occupied",
+               sessions_dir,
+               :all,
+               opts
+             )
+
+    Process.exit(handle.repository, :kill)
+    assert :ok = await_repository_restarted(repo, handle.repository, 1_000)
+    assert :ok = File.rm(target_path)
+
+    assert {:error, :already_exists} =
+             Sigma.Agent.Runtime.fork_session(
+               repo,
+               "source",
+               "occupied",
+               sessions_dir,
+               :all,
+               opts
+             )
+
+    refute File.exists?(target_path)
+  end
+
+  test "terminal persistence failure is explicit and restart does not repeat the mutation",
+       context do
+    repo = tmp_repo!(context, "repo-operation-terminal-failure")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+    target_path = Path.join(sessions_dir, "fork.jsonl")
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+
+    assert {:ok, handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(
+                 cwd: repo,
+                 transcript_path: source_path,
+                 storage_mod: FailOperationTerminalStorage
+               )
+             )
+
+    opts = mutation_opts(source_path, "terminal-failure-1")
+
+    assert {:error,
+            {:operation_result_persistence_failed, {:ok, %{session_id: "fork"}},
+             {:storage_append_failed, :terminal_write_failed}}} =
+             Sigma.Agent.Runtime.fork_session(
+               repo,
+               "source",
+               "fork",
+               sessions_dir,
+               :all,
+               opts
+             )
+
+    assert File.exists?(target_path)
+    Process.exit(handle.repository, :kill)
+    assert :ok = await_repository_restarted(repo, handle.repository, 1_000)
+    assert :ok = File.rm(target_path)
+
+    assert {:error, {:operation_interrupted, "terminal-failure-1"}} =
+             Sigma.Agent.Runtime.fork_session(
+               repo,
+               "source",
+               "fork",
+               sessions_dir,
+               :all,
+               opts
+             )
+
+    refute File.exists?(target_path)
+  end
+
+  test "mutating session operations require identity, revision, and leaf", context do
+    repo = tmp_repo!(context, "repo-operation-contract")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+
+    assert {:error, :operation_id_required} =
+             Sigma.Agent.Runtime.fork_session(repo, "source", "fork", sessions_dir)
+
+    assert {:error, :expected_source_revision_required} =
+             Sigma.Agent.Runtime.compact_session(repo, "source", sessions_dir,
+               operation_id: "compact"
+             )
+
+    assert {:error, :expected_source_leaf_required} =
+             Sigma.Agent.Runtime.retry_turn(repo, "source", sessions_dir, "missing",
+               operation_id: "retry",
+               expected_source_revision: 1
+             )
+  end
+
+  test "retry creates one replacement turn from the persisted checkpoint", context do
+    repo = tmp_repo!(context, "repo-retry")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    workspace_file = Path.join(repo, "workspace-sentinel.txt")
+    File.write!(workspace_file, "retry must not restore files")
+    source_path = Path.join(sessions_dir, "source.jsonl")
+
+    first = %{
+      Sigma.Agent.Message.user("first", "first prompt")
+      | metadata: %{turn_id: "turn-first"}
+    }
+
+    second = %{
+      Sigma.Agent.Message.user("second", [
+        %{type: :text, text: "second prompt"},
+        %{type: :image, data: "aW1hZ2U=", mime_type: "image/png"}
+      ])
+      | metadata: %{turn_id: "turn-second"},
+        attachments: [%{"name" => "image.png", "size" => 5}]
+    }
+
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+    :ok = Sigma.Session.Log.persist_event(source_path, {:message_end, first})
+
+    :ok =
+      Sigma.Session.Log.persist_event(
+        source_path,
+        {:message_end, Sigma.Agent.Message.assistant("first-answer", %{content: "old first"})}
+      )
+
+    :ok = Sigma.Session.Log.persist_event(source_path, {:message_end, second})
+
+    :ok =
+      Sigma.Session.Log.persist_event(
+        source_path,
+        {:message_end, Sigma.Agent.Message.assistant("second-answer", %{content: "old second"})}
+      )
+
+    assert {:ok, before} = Sigma.Session.Log.snapshot(source_path)
+
+    assert {:ok, handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(cwd: repo, transcript_path: source_path, messages: before.messages)
+             )
+
+    Sigma.Agent.subscribe(handle.agent)
+    operation_id = "retry-op-1"
+
+    assert {:ok, result} =
+             Sigma.Agent.Runtime.retry_turn(repo, "source", sessions_dir, "second",
+               operation_id: operation_id,
+               expected_source_revision: length(before.branch_entry_ids) + 1,
+               expected_source_leaf: before.active_leaf_id
+             )
+
+    assert result.retry_of_turn_id == "turn-second"
+    assert result.turn_id != "turn-second"
+
+    assert {:ok, duplicate} =
+             Sigma.Agent.Runtime.retry_turn(repo, "source", sessions_dir, "second",
+               operation_id: operation_id,
+               expected_source_revision: length(before.branch_entry_ids) + 1,
+               expected_source_leaf: before.active_leaf_id
+             )
+
+    assert duplicate == result
+    assert_receive {:turn_failed, retry_turn_id}, 1_000
+    assert retry_turn_id == result.turn_id
+    assert {:ok, after_snapshot} = Sigma.Session.Log.snapshot(source_path)
+
+    assert Enum.map(after_snapshot.messages, & &1.id) == [
+             "first",
+             "first-answer",
+             result.message_id
+           ]
+
+    assert List.last(after_snapshot.messages).metadata == %{
+             "retry_of_turn_id" => "turn-second",
+             "turn_id" => result.turn_id
+           }
+
+    assert List.last(after_snapshot.messages).attachments == [
+             %{"name" => "image.png", "size" => 5}
+           ]
+
+    assert {:ok, entries} = Sigma.Session.Storage.JsonlFile.read(source_path)
+    assert Enum.any?(entries, &(get_in(&1, ["message", "id"]) == "second-answer"))
+
+    assert Enum.count(entries, fn entry ->
+             get_in(entry, ["message", "metadata", "retry_of_turn_id"]) == "turn-second"
+           end) == 1
+
+    assert File.read!(workspace_file) == "retry must not restore files"
+  end
+
+  test "retry checkpoint remains addressable after the session is renamed", context do
+    repo = tmp_repo!(context, "repo-renamed-retry")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+    renamed_path = Path.join(sessions_dir, "renamed.jsonl")
+
+    user = %{
+      Sigma.Agent.Message.user("retry-source", "retry after rename")
+      | metadata: %{turn_id: "turn-source"}
+    }
+
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+    :ok = Sigma.Session.Log.persist_event(source_path, {:message_end, user})
+
+    :ok =
+      Sigma.Session.Log.persist_event(
+        source_path,
+        {:message_end, Sigma.Agent.Message.assistant("source-answer", %{content: "old"})}
+      )
+
+    assert {:ok, before} = Sigma.Session.Log.snapshot(source_path)
+
+    assert {:ok, _handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(cwd: repo, transcript_path: source_path, messages: before.messages)
+             )
+
+    assert {:ok, %{session_id: "renamed"}} =
+             Sigma.Agent.Runtime.rename_session(repo, "source", "renamed", sessions_dir)
+
+    refute File.exists?(source_path)
+    assert File.exists?(renamed_path)
+    assert {:ok, renamed} = Sigma.Session.Log.snapshot(renamed_path)
+
+    assert {:ok, handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "renamed",
+               session_opts(cwd: repo, transcript_path: renamed_path, messages: renamed.messages)
+             )
+
+    Sigma.Agent.subscribe(handle.agent)
+
+    assert {:ok, result} =
+             Sigma.Agent.Runtime.retry_turn(
+               repo,
+               "renamed",
+               sessions_dir,
+               "retry-source",
+               mutation_opts(renamed_path, "renamed-retry-1")
+             )
+
+    assert result.retry_of_turn_id == "turn-source"
+    assert_receive {:turn_failed, retry_turn_id}, 1_000
+    assert retry_turn_id == result.turn_id
+
+    assert {:ok, entries} = Sigma.Session.Storage.JsonlFile.read(renamed_path)
+
+    assert Enum.count(entries, fn entry ->
+             get_in(entry, ["message", "metadata", "retry_of_turn_id"]) == "turn-source"
+           end) == 1
+  end
+
+  test "concurrent retry submissions with one operation id execute one replacement", context do
+    repo = tmp_repo!(context, "repo-concurrent-retry")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+
+    user = %{
+      Sigma.Agent.Message.user("retry-source", "retry once")
+      | metadata: %{turn_id: "turn-source"}
+    }
+
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+    :ok = Sigma.Session.Log.persist_event(source_path, {:message_end, user})
+
+    assert {:ok, before} = Sigma.Session.Log.snapshot(source_path)
+
+    assert {:ok, handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(cwd: repo, transcript_path: source_path, messages: before.messages)
+             )
+
+    Sigma.Agent.subscribe(handle.agent)
+    opts = mutation_opts(source_path, "concurrent-retry-1")
+    parent = self()
+
+    submissions =
+      for _client <- 1..2 do
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :submit ->
+              Sigma.Agent.Runtime.retry_turn(
+                repo,
+                "source",
+                sessions_dir,
+                "retry-source",
+                opts
+              )
+          end
+        end)
+      end
+
+    submitters =
+      for _client <- 1..2 do
+        assert_receive {:ready, submitter}, 1_000
+        submitter
+      end
+
+    Enum.each(submitters, &send(&1, :submit))
+
+    assert [{:ok, first_result}, {:ok, second_result}] =
+             Enum.map(submissions, &Task.await(&1, 5_000))
+
+    assert first_result == second_result
+    result = first_result
+    assert result.retry_of_turn_id == "turn-source"
+    assert_receive {:turn_failed, retry_turn_id}, 1_000
+    assert retry_turn_id == result.turn_id
+
+    assert {:ok, entries} = Sigma.Session.Storage.JsonlFile.read(source_path)
+
+    assert Enum.count(entries, fn entry ->
+             get_in(entry, ["message", "metadata", "retry_of_turn_id"]) == "turn-source"
+           end) == 1
+  end
+
+  test "retry rejects attachment references that no longer have materialized content", context do
+    repo = tmp_repo!(context, "repo-retry-missing-attachment")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+
+    user = %{
+      Sigma.Agent.Message.user("retry-user", "review the attachment")
+      | metadata: %{turn_id: "turn-original"},
+        attachments: [%{"name" => "missing.txt", "size" => 12}]
+    }
+
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+    :ok = Sigma.Session.Log.persist_event(source_path, {:message_end, user})
+
+    :ok =
+      Sigma.Session.Log.persist_event(
+        source_path,
+        {:message_end, Sigma.Agent.Message.assistant("answer", %{content: "old"})}
+      )
+
+    assert {:ok, snapshot} = Sigma.Session.Log.snapshot(source_path)
+
+    assert {:ok, _handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(cwd: repo, transcript_path: source_path, messages: snapshot.messages)
+             )
+
+    assert {:error, :retry_attachments_unavailable} =
+             Sigma.Agent.Runtime.retry_turn(repo, "source", sessions_dir, "retry-user",
+               operation_id: "retry-missing-attachment",
+               expected_source_revision: length(snapshot.branch_entry_ids) + 1,
+               expected_source_leaf: snapshot.active_leaf_id
+             )
+
+    assert {:ok, unchanged} = Sigma.Session.Log.snapshot(source_path)
+    assert unchanged.active_leaf_id == snapshot.active_leaf_id
+    assert unchanged.messages == snapshot.messages
+  end
+
+  test "retry requires an explicit current replacement when the original model is unavailable",
+       context do
+    repo = tmp_repo!(context, "repo-retry-model")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+
+    user = %{Sigma.Agent.Message.user("retry-user", "again") | metadata: %{turn_id: "turn-old"}}
+
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+    {:ok, _entry_id} = Sigma.Session.Log.append_model_change(source_path, "anthropic", "old")
+    :ok = Sigma.Session.Log.persist_event(source_path, {:message_end, user})
+
+    :ok =
+      Sigma.Session.Log.persist_event(
+        source_path,
+        {:message_end, Sigma.Agent.Message.assistant("old-answer", %{content: "old"})}
+      )
+
+    {:ok, _entry_id} = Sigma.Session.Log.append_model_change(source_path, "openai", "current")
+    {:ok, snapshot} = Sigma.Session.Log.snapshot(source_path)
+
+    assert {:ok, _handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(cwd: repo, transcript_path: source_path, messages: snapshot.messages)
+             )
+
+    opts = mutation_opts(source_path, "retry-original-unavailable")
+
+    assert {:error,
+            {:retry_model_selection_required,
+             %{
+               original_provider_id: "anthropic",
+               original_model_id: "old",
+               current_provider_id: "openai",
+               current_model_id: "current"
+             }}} =
+             Sigma.Agent.Runtime.retry_turn(repo, "source", sessions_dir, "retry-user", opts)
+
+    replacement_opts =
+      source_path
+      |> mutation_opts("retry-with-replacement")
+      |> Keyword.merge(provider_id: "openai", model_id: "current")
+
+    assert {:ok, %{retry_of_turn_id: "turn-old"}} =
+             Sigma.Agent.Runtime.retry_turn(
+               repo,
+               "source",
+               sessions_dir,
+               "retry-user",
+               replacement_opts
+             )
+  end
+
+  test "fork rejects a stale source revision or active leaf", context do
+    repo = tmp_repo!(context, "repo-operations-conflict")
+    sessions_dir = Path.join(repo, "sessions")
+    File.mkdir_p!(sessions_dir)
+    source_path = Path.join(sessions_dir, "source.jsonl")
+
+    :ok = Sigma.Session.Log.persist_event(source_path, {:agent_start, repo})
+
+    assert {:ok, handle} =
+             Sigma.Agent.Runtime.get_session(
+               repo,
+               "source",
+               session_opts(cwd: repo, transcript_path: source_path)
+             )
+
+    :ok =
+      Sigma.Agent.SessionProcess.record_event(
+        handle.session,
+        {:message_end, Sigma.Agent.Message.user("checkpoint", "accepted")},
+        nil
+      )
+
+    :ok =
+      Sigma.Agent.SessionProcess.record_event(
+        handle.session,
+        {:message_end, Sigma.Agent.Message.assistant("checkpoint-answer", %{content: "done"})},
+        nil
+      )
+
+    assert {:ok, before} = Sigma.Session.Log.snapshot(source_path)
+    expected_revision = length(before.branch_entry_ids) + 1
+    expected_leaf = before.active_leaf_id
+
+    assert {:ok, %{session_id: "checkpoint-fork"}} =
+             Sigma.Agent.Runtime.fork_session(
+               repo,
+               "source",
+               "checkpoint-fork",
+               sessions_dir,
+               :all,
+               operation_id: "checkpoint-fork",
+               expected_source_revision: expected_revision,
+               expected_source_leaf: expected_leaf
+             )
+
+    :ok =
+      Sigma.Agent.SessionProcess.record_event(
+        handle.session,
+        {:message_end, Sigma.Agent.Message.user("newer", "accepted")},
+        nil
+      )
+
+    assert {:error, {:revision_conflict, %{expected: ^expected_revision}}} =
+             Sigma.Agent.Runtime.fork_session(
+               repo,
+               "source",
+               "stale-revision",
+               sessions_dir,
+               :all,
+               operation_id: "stale-revision",
+               expected_source_revision: expected_revision,
+               expected_source_leaf: before.active_leaf_id
+             )
+
+    assert {:error, {:leaf_conflict, %{expected: ^expected_leaf}}} =
+             Sigma.Agent.Runtime.fork_session(
+               repo,
+               "source",
+               "stale-leaf",
+               sessions_dir,
+               :all,
+               operation_id: "stale-leaf",
+               expected_source_revision: length(before.branch_entry_ids) + 2,
+               expected_source_leaf: expected_leaf
+             )
+
+    refute File.exists?(Path.join(sessions_dir, "stale-revision.jsonl"))
+    refute File.exists?(Path.join(sessions_dir, "stale-leaf.jsonl"))
+  end
+
+  test "session operation lock atomically rejects prompt admission until transition completes",
+       context do
     repo = tmp_repo!(context, "repo-operation-lock")
     sessions_dir = Path.join(repo, "sessions")
     File.mkdir_p!(sessions_dir)
@@ -640,7 +1413,14 @@ defmodule Sigma.Agent.RuntimeTest do
     assert :ok = await_repository_restarted(repo, handle.repository, 1_000)
 
     assert {:error, :session_busy} =
-             Sigma.Agent.Runtime.fork_session(repo, "source", "fork", sessions_dir)
+             Sigma.Agent.Runtime.fork_session(
+               repo,
+               "source",
+               "fork",
+               sessions_dir,
+               :all,
+               mutation_opts(source_path, "busy-after-restart")
+             )
 
     refute File.exists?(Path.join(sessions_dir, "fork.jsonl"))
   end
@@ -650,9 +1430,21 @@ defmodule Sigma.Agent.RuntimeTest do
     do_await_repository_restarted(repo, old_pid, deadline)
   end
 
+  defp mutation_opts(source_path, operation_id) do
+    {:ok, snapshot} = Sigma.Session.Log.snapshot(source_path)
+
+    [
+      operation_id: operation_id,
+      expected_source_revision: length(snapshot.branch_entry_ids) + 1,
+      expected_source_leaf: snapshot.active_leaf_id
+    ]
+  end
+
   defp do_await_repository_restarted(repo, old_pid, deadline) do
     case Sigma.Agent.Runtime.lookup(repo, :process) do
-      pid when is_pid(pid) and pid != old_pid -> :ok
+      pid when is_pid(pid) and pid != old_pid ->
+        :ok
+
       _pid ->
         if System.monotonic_time(:millisecond) >= deadline do
           {:error, :timeout}

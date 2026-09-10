@@ -8,10 +8,11 @@ defmodule Sigma.Agent do
 
   alias Sigma.Agent.Message
   alias Sigma.Agent.ContextBuilder
+  alias Sigma.Agent.ContextPolicy
   alias Sigma.Agent.PromptQueue
   alias Sigma.Agent.SessionContext
   alias Sigma.Agent.TurnState
-  alias Sigma.Ai.{Provider, ProviderError, ProviderEvent, ProviderRequest}
+  alias Sigma.Ai.{Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderUsage}
   alias Sigma.Ai.Providers.Anthropic
   alias Sigma.Coding.ToolError
 
@@ -28,11 +29,17 @@ defmodule Sigma.Agent do
     :base_tools,
     :cwd,
     :on_event,
+    :writer,
     :dispatcher_opts,
     :tool_state,
     :provider_options,
     :task_supervisor,
     :current_turn_task,
+    :current_request_id,
+    :context_snapshot,
+    :context_policy,
+    :turn_started_at,
+    :turn_started_monotonic,
     :control_pid,
     :last_cancelled_turn_id,
     :policy,
@@ -73,6 +80,10 @@ defmodule Sigma.Agent do
     GenServer.call(pid, {:subscribe, self()})
   end
 
+  def subscribe_snapshot(pid) do
+    GenServer.call(pid, {:subscribe_snapshot, self()})
+  end
+
   def unsubscribe(pid) do
     GenServer.call(pid, {:unsubscribe, self()})
   end
@@ -97,8 +108,18 @@ defmodule Sigma.Agent do
 
   def context_preview(pid), do: GenServer.call(pid, :context_preview)
 
+  @doc "Admits one replacement turn from an already validated persisted checkpoint."
+  def retry(pid, context_messages, content, retry_of_turn_id, opts \\ []) do
+    GenServer.call(
+      pid,
+      {:retry_checkpoint, context_messages, content, retry_of_turn_id, opts},
+      :infinity
+    )
+  end
+
   def begin_session_operation(pid), do: GenServer.call(pid, :begin_session_operation)
   def end_session_operation(pid), do: GenServer.call(pid, :end_session_operation)
+  def compact(pid, opts \\ []), do: GenServer.call(pid, {:compact, opts}, :infinity)
 
   def ask_user_question(pid, request, opts \\ []) when is_map(request) do
     question_id = "ask_#{System.unique_integer([:positive])}"
@@ -222,6 +243,19 @@ defmodule Sigma.Agent do
         :error -> Sigma.Coding.Hooks.Discovery.load(cwd)
       end
 
+    context_snapshot =
+      ContextPolicy.snapshot(
+        context_revision: Keyword.get(opts, :context_revision, 0),
+        active_leaf: Keyword.get(opts, :active_leaf),
+        model: opts[:model],
+        source: Keyword.get(opts, :context_source, :runtime_start),
+        messages: opts[:messages] || [],
+        system: :unknown,
+        tools: :unknown,
+        skills: :unknown,
+        stale: true
+      )
+
     state = %__MODULE__{
       task_supervisor: task_supervisor,
       policy: policy,
@@ -238,6 +272,7 @@ defmodule Sigma.Agent do
       messages: opts[:messages] || [],
       cwd: cwd,
       on_event: opts[:on_event],
+      writer: opts[:writer],
       dispatcher_opts: opts[:dispatcher_opts] || [],
       tool_state:
         opts[:tool_state] ||
@@ -248,6 +283,8 @@ defmodule Sigma.Agent do
             write_concurrency: true
           ]),
       provider_options: opts[:options] || [],
+      context_snapshot: context_snapshot,
+      context_policy: context_policy(context_snapshot, opts[:model], opts[:options] || []),
       hook_specs: hook_specs,
       prompt_queue: PromptQueue.new(),
       turn_state: TurnState.idle(),
@@ -287,6 +324,11 @@ defmodule Sigma.Agent do
     {:reply, :ok, %{state | subscribers: Enum.uniq([subscriber_pid | state.subscribers])}}
   end
 
+  def handle_call({:subscribe_snapshot, subscriber_pid}, _from, state) do
+    state = %{state | subscribers: Enum.uniq([subscriber_pid | state.subscribers])}
+    {:reply, status_snapshot(state), state}
+  end
+
   @impl true
   def handle_call({:unsubscribe, subscriber_pid}, _from, state) do
     {:reply, :ok, %{state | subscribers: List.delete(state.subscribers, subscriber_pid)}}
@@ -294,15 +336,7 @@ defmodule Sigma.Agent do
 
   @impl true
   def handle_call(:status, _from, state) do
-    counts = PromptQueue.counts(state.prompt_queue)
-
-    {:reply,
-     %{
-       phase: state.turn_state.phase,
-       turn_id: state.turn_state.turn_id,
-       steering_queue_count: counts.steering,
-       follow_up_queue_count: counts.follow_up
-     }, state}
+    {:reply, status_snapshot(state), state}
   end
 
   @impl true
@@ -345,6 +379,47 @@ defmodule Sigma.Agent do
       {:reply, :ok, %{state | turn_state: TurnState.transition(state.turn_state, :idle)}}
     else
       {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:compact, opts}, _from, state) do
+    if state.turn_state.phase == :session_operation and is_nil(state.current_turn_task) do
+      {state, result} = run_compact(state, Keyword.put(opts, :trigger, :manual))
+      {:reply, result, state}
+    else
+      {:reply, {:error, :session_busy}, state}
+    end
+  end
+
+  def handle_call(
+        {:retry_checkpoint, context_messages, content, retry_of_turn_id, opts},
+        _from,
+        state
+      ) do
+    cond do
+      state.turn_state.phase != :session_operation or not is_nil(state.current_turn_task) ->
+        {:reply, {:rejected, :session_busy}, state}
+
+      not is_list(context_messages) or not is_binary(retry_of_turn_id) or
+          retry_of_turn_id == "" ->
+        {:reply, {:rejected, :invalid_retry_checkpoint}, state}
+
+      true ->
+        opts = Keyword.put(opts, :retry_of_turn_id, retry_of_turn_id)
+
+        case new_prompt_item(content, opts) do
+          {:ok, item} ->
+            item = Map.put(item, :retry_restore_messages, state.messages)
+            state = %{state | messages: context_messages}
+            state = start_turn(state, item)
+            info = prompt_info(item, item.turn_id)
+            emit(state, {:prompt_admitted, :accepted, info})
+            emit_prompt_telemetry(state, :accepted)
+            {:reply, {:accepted, info}, state}
+
+          {:error, reason} ->
+            {:reply, {:rejected, reason}, state}
+        end
     end
   end
 
@@ -439,10 +514,12 @@ defmodule Sigma.Agent do
   def handle_call({:change_provider, provider, model, options, persist}, _from, state) do
     case run_state_change(persist) do
       :ok ->
-        {:reply, :ok, %{state | provider: provider, model: model, provider_options: options}}
+        state = %{state | provider: provider, model: model, provider_options: options}
+        {:reply, :ok, invalidate_context(state, :model_change)}
 
       {:ok, _result} = success ->
-        {:reply, success, %{state | provider: provider, model: model, provider_options: options}}
+        state = %{state | provider: provider, model: model, provider_options: options}
+        {:reply, success, invalidate_context(state, :model_change)}
 
       {:error, _reason} = error ->
         {:reply, error, state}
@@ -562,12 +639,13 @@ defmodule Sigma.Agent do
 
   @impl true
   def handle_cast({:set_model, model}, state) do
-    {:noreply, %{state | model: model}}
+    {:noreply, state |> Map.put(:model, model) |> invalidate_context(:model_change)}
   end
 
   @impl true
   def handle_cast({:set_provider, provider, model, options}, state) do
-    {:noreply, %{state | provider: provider, model: model, provider_options: options}}
+    state = %{state | provider: provider, model: model, provider_options: options}
+    {:noreply, invalidate_context(state, :model_change)}
   end
 
   @impl true
@@ -611,6 +689,14 @@ defmodule Sigma.Agent do
     end
   end
 
+  def handle_cast({:current_request, turn_id, request_id}, state) do
+    if state.turn_state.turn_id == turn_id do
+      {:noreply, %{state | current_request_id: request_id}}
+    else
+      {:noreply, state}
+    end
+  end
+
   @impl true
   def handle_cast({:prompt, prompt_text}, state) do
     handle_cast({:prompt, prompt_text, []}, state)
@@ -623,7 +709,17 @@ defmodule Sigma.Agent do
   end
 
   @impl true
-  def handle_info({ref, {:ok, %{messages: new_messages, outcome: task_outcome}}}, state)
+  def handle_info(
+        {ref,
+         {:ok,
+          %{
+            messages: new_messages,
+            outcome: task_outcome,
+            context_snapshot: context_snapshot,
+            context_policy: context_policy
+          }}},
+        state
+      )
       when is_reference(ref) do
     case state.current_turn_task do
       %Task{ref: ^ref} ->
@@ -634,11 +730,36 @@ defmodule Sigma.Agent do
           state
           |> clear_cancel_timer()
           |> Map.put(:messages, new_messages)
+          |> Map.put(:context_snapshot, context_snapshot)
+          |> Map.put(:context_policy, context_policy)
           |> Map.put(:current_turn_task, nil)
           |> finish_turn(outcome)
 
         emit(new_state, {:agent_end, new_messages})
         {:noreply, maybe_start_follow_up(new_state, outcome)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        {ref, {:error, {:event_persistence_failed, _event_type, _persistence_reason} = reason}},
+        state
+      )
+      when is_reference(ref) do
+    case state.current_turn_task do
+      %Task{ref: ^ref} ->
+        Process.demonitor(ref, [:flush])
+
+        new_state =
+          state
+          |> clear_cancel_timer()
+          |> Map.put(:current_turn_task, nil)
+          |> finish_turn(:failed, reason, persist_metrics?: false)
+
+        emit(new_state, {:turn_error, reason})
+        {:noreply, maybe_start_follow_up(new_state, :failed)}
 
       _ ->
         {:noreply, state}
@@ -655,7 +776,7 @@ defmodule Sigma.Agent do
           state
           |> clear_cancel_timer()
           |> Map.put(:current_turn_task, nil)
-          |> finish_turn(if(cancelling?, do: :cancelled, else: :failed))
+          |> finish_turn(if(cancelling?, do: :cancelled, else: :failed), reason)
 
         unless cancelling?, do: emit(new_state, {:turn_error, reason})
 
@@ -690,7 +811,7 @@ defmodule Sigma.Agent do
           state
           |> clear_cancel_timer()
           |> Map.put(:current_turn_task, nil)
-          |> finish_turn(outcome)
+          |> finish_turn(outcome, reason)
 
         {:noreply, maybe_start_follow_up(new_state, outcome)}
 
@@ -744,6 +865,20 @@ defmodule Sigma.Agent do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  defp status_snapshot(state) do
+    counts = PromptQueue.counts(state.prompt_queue)
+
+    %{
+      phase: state.turn_state.phase,
+      turn_id: state.turn_state.turn_id,
+      current_request_id: state.current_request_id,
+      context_snapshot: state.context_snapshot,
+      context_policy: state.context_policy,
+      steering_queue_count: counts.steering,
+      follow_up_queue_count: counts.follow_up
+    }
+  end
+
   defp admit_prompt(state, content, opts, requested_mode) do
     case new_prompt_item(content, opts) do
       {:error, reason} ->
@@ -785,6 +920,9 @@ defmodule Sigma.Agent do
          message_id: "msg_user_#{random_id(8)}",
          turn_id: "turn_#{random_id(8)}",
          content: content,
+         attachments: Keyword.get(opts, :attachments),
+         retry_of_turn_id: Keyword.get(opts, :retry_of_turn_id),
+         retry_admission_notify: Keyword.get(opts, :retry_admission_notify),
          dispatcher_opts: Keyword.get(opts, :dispatcher_opts, [])
        }}
     end
@@ -805,6 +943,8 @@ defmodule Sigma.Agent do
   defp start_turn(state, item) do
     control_pid = self()
     cancellation_ref = make_ref()
+    turn_started_at = DateTime.utc_now() |> DateTime.to_iso8601()
+    turn_started_monotonic = System.monotonic_time(:millisecond)
 
     dispatcher_opts =
       state.dispatcher_opts
@@ -821,6 +961,8 @@ defmodule Sigma.Agent do
         current_turn_task: nil,
         dispatcher_opts: dispatcher_opts,
         provider_options: provider_options,
+        turn_started_at: turn_started_at,
+        turn_started_monotonic: turn_started_monotonic,
         turn_state: TurnState.start(item.turn_id, cancellation_ref)
     }
 
@@ -837,6 +979,8 @@ defmodule Sigma.Agent do
     %{
       state
       | current_turn_task: task,
+        turn_started_at: turn_started_at,
+        turn_started_monotonic: turn_started_monotonic,
         turn_state: TurnState.start(item.turn_id, cancellation_ref),
         last_cancelled_turn_id: nil
     }
@@ -856,10 +1000,34 @@ defmodule Sigma.Agent do
 
   defp random_id(bytes), do: :crypto.strong_rand_bytes(bytes) |> Base.encode16(case: :lower)
 
-  defp finish_turn(state, outcome) do
+  defp finish_turn(state, outcome, reason \\ nil, opts \\ []) do
     turn_id = state.turn_state.turn_id
     turn_state = TurnState.transition(state.turn_state, outcome)
     state = %{state | turn_state: turn_state}
+
+    if Keyword.get(opts, :persist_metrics?, true) do
+      emit(
+        state,
+        {:metrics, :turn_finished,
+         %{
+           turn_id: turn_id,
+           session_id: state.session_id,
+           revision: 1,
+           status: outcome,
+           reason: reason,
+           started_at: state.turn_started_at,
+           finished_at: DateTime.utc_now() |> DateTime.to_iso8601(),
+           wall_ms: elapsed_since(state.turn_started_monotonic)
+         }}
+      )
+    end
+
+    state = %{
+      state
+      | turn_started_at: nil,
+        turn_started_monotonic: nil,
+        current_request_id: nil
+    }
 
     case outcome do
       :completed ->
@@ -925,26 +1093,66 @@ defmodule Sigma.Agent do
   defp execute_turn(state, item) do
     emit(state, {:agent_start, state.cwd})
 
+    emit(
+      state,
+      {:metrics, :turn_started,
+       %{
+         turn_id: item.turn_id,
+         session_id: state.session_id,
+         revision: 0,
+         status: :running,
+         reason: nil,
+         started_at: state.turn_started_at
+       }}
+    )
+
     state = %{state | stop_hook_active: false}
-    user_msg = Message.user(item.message_id, item.content)
+
+    user_msg =
+      Message.user(item.message_id, item.content)
+      |> Map.put(:attachments, item.attachments)
+      |> Map.put(:metadata, %{
+        turn_id: item.turn_id,
+        retry_of_turn_id: item.retry_of_turn_id
+      })
 
     case run_user_prompt_submit_hook(state, user_msg) do
       {:block, reason} ->
+        notify_retry_admission(item, {:error, reason})
         emit(state, {:turn_blocked, reason})
-        %{messages: state.messages, outcome: :failed}
+
+        %{
+          messages: Map.get(item, :retry_restore_messages, state.messages),
+          outcome: :failed,
+          context_snapshot: state.context_snapshot,
+          context_policy: state.context_policy
+        }
 
       {:ok, user_msg, state} ->
         state = %{state | messages: state.messages ++ [user_msg]}
         emit(state, {:message_start, user_msg})
         emit(state, {:message_end, user_msg})
+        notify_retry_admission(item, :committed)
         acknowledge_canonical(state)
 
         {state, outcome} = run_turn_loop(state, item.turn_id)
         state = if outcome == :completed, do: maybe_compact(state), else: state
 
-        %{messages: state.messages, outcome: outcome}
+        %{
+          messages: state.messages,
+          outcome: outcome,
+          context_snapshot: state.context_snapshot,
+          context_policy: state.context_policy
+        }
     end
   end
+
+  defp notify_retry_admission(%{retry_admission_notify: {pid, ref}}, result)
+       when is_pid(pid) and is_reference(ref) do
+    send(pid, {:retry_admission, ref, result})
+  end
+
+  defp notify_retry_admission(_item, _result), do: :ok
 
   defp run_turn_loop(state, turn_id) do
     set_turn_phase(state, turn_id, :streaming_provider)
@@ -962,10 +1170,26 @@ defmodule Sigma.Agent do
         model: state.model
       )
 
+    state = refresh_context_from_assembly(state, context)
+
+    case context_budget_error(state, context) do
+      nil ->
+        run_provider_step(state, turn_id, context)
+
+      error ->
+        emit(state, {:turn_error, error})
+        {state, :failed}
+    end
+  end
+
+  defp run_provider_step(state, turn_id, context) do
     params = %{
       model: state.model,
       session_id: state.session_id,
       log_session_id: state.log_session_id,
+      turn_id: turn_id,
+      origin_session_id: state.session_id,
+      purpose: :turn,
       context: context,
       options: state.provider_options
     }
@@ -998,6 +1222,34 @@ defmodule Sigma.Agent do
           end
         end
     end
+  end
+
+  defp context_budget_error(state, context) do
+    snapshot =
+      ContextPolicy.snapshot(
+        model: state.model,
+        system: context.system,
+        messages: context.messages,
+        tools: context.tools
+      )
+
+    policy =
+      ContextPolicy.policy(snapshot,
+        model: state.model,
+        output_reserve: provider_output_reserve(state.provider_options)
+      )
+
+    if policy.overflow in [:overflow, :hard_overflow] do
+      ProviderError.from_exception(
+        "context token limit exceeded: estimated input " <>
+          "#{snapshot.next_request_estimated_input_tokens}, output reserve " <>
+          "#{policy.output_reserve}, context window #{policy.context_window}"
+      )
+    end
+  end
+
+  defp provider_output_reserve(options) do
+    Keyword.get(options, :max_tokens) || Keyword.get(options, :max_output_tokens)
   end
 
   defp continue_after_safe_boundary(state, turn_id) do
@@ -1056,51 +1308,149 @@ defmodule Sigma.Agent do
 
   defp set_turn_phase(_state, _turn_id, _phase), do: :ok
 
-  defp run_stream(state, params) do
-    stream = Provider.stream(state.provider, ProviderRequest.from_legacy(params))
+  defp set_current_request(%{control_pid: control_pid}, turn_id, request_id)
+       when is_pid(control_pid),
+       do: GenServer.cast(control_pid, {:current_request, turn_id, request_id})
 
+  defp set_current_request(_state, _turn_id, _request_id), do: :ok
+
+  defp run_stream(state, params) do
     assistant_id = "msg_assistant_#{System.unique_integer([:positive])}"
 
-    {final_state, failed?} =
-      Enum.reduce_while(stream, {state, false}, fn event, {acc_state, _failed?} ->
+    request =
+      params
+      |> Map.put(:message_id, assistant_id)
+      |> ProviderRequest.new()
+      |> ProviderRequest.begin(System.monotonic_time(:millisecond), DateTime.utc_now())
+
+    state = %{state | current_request_id: request.request_id}
+    set_current_request(state, request.turn_id, request.request_id)
+    emit(state, {:metrics, :request_started, request_fact(request)})
+
+    run_stream_request(state, request, assistant_id)
+  end
+
+  defp run_stream_request(state, request, assistant_id) do
+    stream = Provider.stream(state.provider, request)
+
+    {final_state, failed?, final_request, terminal_status} =
+      Enum.reduce_while(stream, {state, false, request, nil}, fn event,
+                                                                 {acc_state, _failed?,
+                                                                  acc_request, terminal_status} ->
         case event do
           %ProviderEvent{type: :response_started, message: ai_msg} ->
-            agent_msg = ai_to_agent_message(ai_msg, assistant_id)
+            agent_msg = ai_to_agent_message(ai_msg, assistant_id, request.turn_id)
             emit(acc_state, {:message_start, agent_msg})
-            {:cont, {%{acc_state | current_turn_assistant_message: agent_msg}, false}}
+
+            {:cont,
+             {%{acc_state | current_turn_assistant_message: agent_msg}, false, acc_request,
+              terminal_status}}
 
           %ProviderEvent{type: :content_text_delta, message: ai_msg} = normalized_event ->
-            agent_msg = ai_to_agent_message(ai_msg, assistant_id)
+            agent_msg = ai_to_agent_message(ai_msg, assistant_id, request.turn_id)
             emit(acc_state, {:message_update, agent_msg, legacy_stream_event(normalized_event)})
-            {:cont, {%{acc_state | current_turn_assistant_message: agent_msg}, false}}
+
+            next_request =
+              ProviderRequest.mark_output(acc_request, System.monotonic_time(:millisecond), :text)
+
+            {:cont,
+             {%{acc_state | current_turn_assistant_message: agent_msg}, false, next_request,
+              terminal_status}}
 
           %ProviderEvent{type: :content_thinking_delta, message: ai_msg} = normalized_event ->
-            agent_msg = ai_to_agent_message(ai_msg, assistant_id)
+            agent_msg = ai_to_agent_message(ai_msg, assistant_id, request.turn_id)
             emit(acc_state, {:message_update, agent_msg, legacy_stream_event(normalized_event)})
-            {:cont, {%{acc_state | current_turn_assistant_message: agent_msg}, false}}
+
+            next_request =
+              ProviderRequest.mark_output(
+                acc_request,
+                System.monotonic_time(:millisecond),
+                :thinking
+              )
+
+            {:cont,
+             {%{acc_state | current_turn_assistant_message: agent_msg}, false, next_request,
+              terminal_status}}
 
           %ProviderEvent{type: :tool_call_started, message: ai_msg} = normalized_event ->
-            agent_msg = ai_to_agent_message(ai_msg, assistant_id)
+            agent_msg = ai_to_agent_message(ai_msg, assistant_id, request.turn_id)
             emit(acc_state, {:message_update, agent_msg, legacy_stream_event(normalized_event)})
-            {:cont, {%{acc_state | current_turn_assistant_message: agent_msg}, false}}
+
+            next_request =
+              ProviderRequest.mark_output(
+                acc_request,
+                System.monotonic_time(:millisecond),
+                :tool_arguments
+              )
+
+            {:cont,
+             {%{acc_state | current_turn_assistant_message: agent_msg}, false, next_request,
+              terminal_status}}
 
           %ProviderEvent{type: :tool_call_arguments_delta, message: ai_msg} = normalized_event ->
-            agent_msg = ai_to_agent_message(ai_msg, assistant_id)
+            agent_msg = ai_to_agent_message(ai_msg, assistant_id, request.turn_id)
             emit(acc_state, {:message_update, agent_msg, legacy_stream_event(normalized_event)})
-            {:cont, {%{acc_state | current_turn_assistant_message: agent_msg}, false}}
+
+            next_request =
+              ProviderRequest.mark_output(
+                acc_request,
+                System.monotonic_time(:millisecond),
+                :tool_arguments
+              )
+
+            {:cont,
+             {%{acc_state | current_turn_assistant_message: agent_msg}, false, next_request,
+              terminal_status}}
 
           %ProviderEvent{type: :tool_call_completed, message: ai_msg} = normalized_event ->
-            agent_msg = ai_to_agent_message(ai_msg, assistant_id)
+            agent_msg = ai_to_agent_message(ai_msg, assistant_id, request.turn_id)
             emit(acc_state, {:message_update, agent_msg, legacy_stream_event(normalized_event)})
-            {:cont, {%{acc_state | current_turn_assistant_message: agent_msg}, false}}
 
-          %ProviderEvent{type: :usage_updated, message: ai_msg} ->
-            agent_msg = ai_to_agent_message(ai_msg, assistant_id)
-            {:cont, {%{acc_state | current_turn_assistant_message: agent_msg}, false}}
+            next_request =
+              ProviderRequest.mark_output(
+                acc_request,
+                System.monotonic_time(:millisecond),
+                :tool_arguments
+              )
 
-          %ProviderEvent{type: :response_completed, message: ai_msg, stop_reason: stop_reason} ->
-            agent_msg = ai_to_agent_message(ai_msg, assistant_id, stop_reason)
+            {:cont,
+             {%{acc_state | current_turn_assistant_message: agent_msg}, false, next_request,
+              terminal_status}}
+
+          %ProviderEvent{type: :usage_updated, usage: usage, message: ai_msg} ->
+            next_request =
+              case usage || (is_map(ai_msg) && ProviderUsage.from_map(ai_msg[:usage])) do
+                %ProviderUsage{} = normalized ->
+                  %{acc_request | usage: normalized, usage_revision: normalized.usage_revision}
+
+                _missing ->
+                  acc_request
+              end
+
+            next_state =
+              if is_map(ai_msg) do
+                %{
+                  acc_state
+                  | current_turn_assistant_message:
+                      ai_to_agent_message(ai_msg, assistant_id, request.turn_id)
+                }
+              else
+                acc_state
+              end
+
+            {:cont, {next_state, false, next_request, terminal_status}}
+
+          %ProviderEvent{
+            type: :response_completed,
+            message: ai_msg,
+            usage: usage,
+            stop_reason: stop_reason
+          } ->
+            agent_msg = ai_to_agent_message(ai_msg, assistant_id, request.turn_id, stop_reason)
             emit(acc_state, {:message_end, agent_msg})
+
+            next_request =
+              put_request_usage(acc_request, usage || ProviderUsage.from_map(ai_msg[:usage]))
 
             next_state = %{
               acc_state
@@ -1110,17 +1460,28 @@ defmodule Sigma.Agent do
 
             acknowledge_canonical(next_state)
 
-            {:cont, {next_state, false}}
+            {:cont, {next_state, false, next_request, :completed}}
 
           %ProviderEvent{type: :response_failed, error: %ProviderError{kind: :cancelled}} ->
-            {:halt, {acc_state, true}}
+            {:halt, {acc_state, true, acc_request, :cancelled}}
 
           %ProviderEvent{type: :response_failed, error: error} ->
             emit(acc_state, {:turn_error, error})
-            {:halt, {acc_state, true}}
+            {:halt, {acc_state, true, acc_request, :failed}}
         end
       end)
 
+    final_request =
+      ProviderRequest.finish(
+        final_request,
+        terminal_status || if(failed?, do: :failed, else: :completed),
+        System.monotonic_time(:millisecond),
+        DateTime.utc_now()
+      )
+
+    final_state = refresh_context_after_request(final_state, final_request)
+    emit(final_state, {:metrics, :request_finished, request_fact(final_request)})
+    set_current_request(final_state, request.turn_id, nil)
     assistant_msg = final_state.current_turn_assistant_message
 
     cond do
@@ -1137,10 +1498,36 @@ defmodule Sigma.Agent do
     end
   rescue
     exception ->
+      failed =
+        ProviderRequest.finish(
+          request,
+          :failed,
+          System.monotonic_time(:millisecond),
+          DateTime.utc_now()
+        )
+
+      emit(
+        state,
+        {:metrics, :request_finished, request_fact(failed)}
+      )
+
       emit(state, {:turn_error, ProviderError.from_exception(exception)})
       {:error, state}
   catch
     kind, reason ->
+      failed =
+        ProviderRequest.finish(
+          request,
+          :failed,
+          System.monotonic_time(:millisecond),
+          DateTime.utc_now()
+        )
+
+      emit(
+        state,
+        {:metrics, :request_finished, request_fact(failed)}
+      )
+
       emit(state, {:turn_error, ProviderError.from_exception({kind, reason})})
       {:error, state}
   end
@@ -1239,6 +1626,8 @@ defmodule Sigma.Agent do
       |> Keyword.put(:transcript_path, transcript_path(state))
       |> Keyword.put(:hook_specs, state.hook_specs)
       |> Keyword.put(:tool_state, state.tool_state)
+      |> Keyword.put(:request_id, state.current_request_id)
+      |> Keyword.put(:on_tool_fact, fn fact -> emit(state, {:metrics, :tool_finished, fact}) end)
       |> Keyword.put(:on_tool_update, fn update ->
         case Map.get(tool_calls_by_id, update.tool_call_id) do
           nil ->
@@ -1402,11 +1791,13 @@ defmodule Sigma.Agent do
     state
   end
 
-  defp ai_to_agent_message(ai_msg, id) do
-    ai_to_agent_message(ai_msg, id, nil)
+  defp ai_to_agent_message(ai_msg, id, turn_id) do
+    ai_to_agent_message(ai_msg, id, turn_id, nil)
   end
 
-  defp ai_to_agent_message(ai_msg, id, stop_reason) do
+  defp ai_to_agent_message(ai_msg, id, turn_id, stop_reason) do
+    metadata = if is_map(Map.get(ai_msg, :metadata)), do: ai_msg.metadata, else: %{}
+
     Message.assistant(id, %{
       content: ai_msg.content,
       model: ai_msg.model,
@@ -1414,7 +1805,8 @@ defmodule Sigma.Agent do
       usage: ai_msg.usage,
       stop_reason: normalized_stop_reason(stop_reason, ai_msg.stop_reason),
       timestamp: ai_msg.timestamp,
-      response_id: Map.get(ai_msg, :response_id)
+      response_id: Map.get(ai_msg, :response_id),
+      metadata: Map.put(metadata, :turn_id, turn_id)
     })
   end
 
@@ -1435,7 +1827,8 @@ defmodule Sigma.Agent do
       end)
 
     if input_tokens >= compact_threshold(state.model) do
-      run_compact(state)
+      {state, _result} = run_compact(state, trigger: :auto)
+      state
     else
       state
     end
@@ -1483,16 +1876,38 @@ defmodule Sigma.Agent do
 
   defp positive_integer(_value), do: nil
 
-  defp run_compact(state) do
+  defp run_compact(state, opts) do
     {to_summarize, to_keep} = find_compact_boundary(state.messages, 20)
 
     case to_summarize do
       [] ->
-        state
+        {state, {:error, :nothing_to_compact}}
 
       _ ->
+        compaction_id = "compact_#{System.unique_integer([:positive])}"
+        started_at = DateTime.utc_now() |> DateTime.to_iso8601()
+        before_tokens = latest_input_tokens(state.messages)
+        trigger = Keyword.fetch!(opts, :trigger)
+        source_leaf_id = Keyword.get(opts, :source_leaf_id) || current_source_leaf(state)
+
+        emit(
+          state,
+          {:metrics, :compaction,
+           %{
+             compaction_id: compaction_id,
+             revision: 0,
+             status: :started,
+             trigger: trigger,
+             source_leaf_id: source_leaf_id,
+             before_tokens: before_tokens,
+             before_source: if(is_integer(before_tokens), do: :provider_usage, else: :unknown),
+             started_at: started_at
+           }}
+        )
+
         case generate_summary(state, to_summarize) do
-          {:ok, summary_text} ->
+          {:ok, summary_text, request_id}
+          when is_binary(summary_text) and byte_size(summary_text) > 0 ->
             first_kept_id =
               case List.first(to_keep) do
                 nil -> nil
@@ -1508,12 +1923,136 @@ defmodule Sigma.Agent do
 
             new_state = %{state | messages: [summary_msg | to_keep]}
             emit(new_state, {:compact, summary_msg, first_kept_id})
-            new_state
 
-          {:error, _} ->
-            state
+            emit(
+              new_state,
+              {:metrics, :compaction,
+               %{
+                 compaction_id: compaction_id,
+                 revision: 1,
+                 status: :committed,
+                 trigger: trigger,
+                 source_leaf_id: source_leaf_id,
+                 first_kept_id: first_kept_id,
+                 summary_id: summary_msg.id,
+                 request_ids: [request_id],
+                 before_tokens: before_tokens,
+                 after_tokens: compaction_token_estimate([summary_msg | to_keep]),
+                 before_source:
+                   if(is_integer(before_tokens), do: :provider_usage, else: :unknown),
+                 after_source: :estimated,
+                 started_at: started_at,
+                 finished_at: DateTime.utc_now() |> DateTime.to_iso8601()
+               }}
+            )
+
+            context =
+              ContextBuilder.build(
+                messages: new_state.messages,
+                session_context: new_state.session_context,
+                system_prompt: new_state.system_prompt,
+                tools: Enum.map(new_state.tools, &Sigma.Coding.Tool.ai_definition/1),
+                cwd: new_state.cwd,
+                model: new_state.model
+              )
+
+            new_state = refresh_context_from_assembly(new_state, context, :compaction)
+
+            {new_state,
+             {:ok,
+              %{
+                compaction_id: compaction_id,
+                summary_id: summary_msg.id,
+                source_leaf_id: source_leaf_id
+              }}}
+
+          {:ok, _empty, request_id} ->
+            emit_compaction_failure(
+              state,
+              compaction_id,
+              started_at,
+              :empty_summary,
+              request_id,
+              trigger,
+              source_leaf_id
+            )
+
+            {state, {:error, :empty_summary}}
+
+          {:error, reason, request_id} ->
+            emit_compaction_failure(
+              state,
+              compaction_id,
+              started_at,
+              reason,
+              request_id,
+              trigger,
+              source_leaf_id
+            )
+
+            {state, {:error, reason}}
         end
     end
+  end
+
+  defp emit_compaction_failure(
+         state,
+         compaction_id,
+         started_at,
+         reason,
+         request_id,
+         trigger,
+         source_leaf_id
+       ) do
+    emit(
+      state,
+      {:metrics, :compaction,
+       %{
+         compaction_id: compaction_id,
+         revision: 1,
+         status: :failed,
+         trigger: trigger,
+         source_leaf_id: source_leaf_id,
+         request_ids: [request_id],
+         started_at: started_at,
+         finished_at: DateTime.utc_now() |> DateTime.to_iso8601(),
+         failure_reason: inspect(reason)
+       }}
+    )
+  end
+
+  defp current_source_leaf(%{writer: nil}), do: nil
+
+  defp current_source_leaf(%{writer: writer}) do
+    case apply(Sigma.Session.Writer, :flush, [writer]) do
+      {:ok, %{active_leaf_id: active_leaf_id}} -> active_leaf_id
+      _result -> nil
+    end
+  catch
+    :exit, _reason -> nil
+  end
+
+  defp latest_input_tokens(messages) do
+    messages
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      %{role: :assistant, usage: usage} when is_map(usage) ->
+        value = usage[:input] || usage["input"]
+        if is_integer(value) and value >= 0, do: value
+
+      _message ->
+        nil
+    end)
+  end
+
+  defp compaction_token_estimate(messages) do
+    messages
+    |> Enum.map(&inspect/1)
+    |> Enum.join("\n")
+    |> byte_size()
+    |> Kernel.+(3)
+    |> div(4)
+    |> max(1)
   end
 
   # Split messages so to_keep starts at the first user message at or after
@@ -1575,6 +2114,8 @@ defmodule Sigma.Agent do
       model: state.model,
       session_id: state.session_id,
       log_session_id: state.log_session_id,
+      turn_id: state.turn_state.turn_id,
+      purpose: :compaction,
       context: %{
         messages: [%{role: :user, content: [%{type: :text, text: prompt}]}],
         system_prompt: nil,
@@ -1583,34 +2124,131 @@ defmodule Sigma.Agent do
       options: state.provider_options
     }
 
-    try do
-      text =
-        state.provider.stream(params)
-        |> Enum.reduce("", fn
-          {:done, _stop, ai_msg}, _ ->
-            case ai_msg.content do
-              blocks when is_list(blocks) ->
-                Enum.map_join(blocks, "", fn
-                  %{type: :text, text: t} -> t
-                  _ -> ""
-                end)
+    request =
+      params
+      |> Map.put(:origin_session_id, state.session_id)
+      |> ProviderRequest.new()
+      |> ProviderRequest.begin(System.monotonic_time(:millisecond), DateTime.utc_now())
 
-              s when is_binary(s) ->
-                s
-
-              _ ->
-                ""
-            end
-
-          _, acc ->
-            acc
-        end)
-
-      {:ok, text}
-    rescue
-      _ -> {:error, "summary generation failed"}
-    end
+    emit(state, {:metrics, :request_started, request_fact(request)})
+    meter_summary_request(state, request)
   end
+
+  defp meter_summary_request(state, request) do
+    {text, request, status, reason} =
+      state.provider
+      |> Provider.stream(request)
+      |> Enum.reduce_while({"", request, nil, nil}, &reduce_summary_event/2)
+
+    status = status || :failed
+
+    finished =
+      ProviderRequest.finish(
+        request,
+        status,
+        System.monotonic_time(:millisecond),
+        DateTime.utc_now()
+      )
+
+    fact =
+      if status == :completed,
+        do: request_fact(finished),
+        else: Map.put(request_fact(finished), :failure_reason, inspect(reason))
+
+    emit(state, {:metrics, :request_finished, fact})
+
+    if status == :completed,
+      do: {:ok, text, request.request_id},
+      else: {:error, reason || :stream_ended_without_terminal, request.request_id}
+  rescue
+    exception ->
+      finished =
+        ProviderRequest.finish(
+          request,
+          :failed,
+          System.monotonic_time(:millisecond),
+          DateTime.utc_now()
+        )
+
+      emit(
+        state,
+        {:metrics, :request_finished,
+         Map.put(request_fact(finished), :failure_reason, inspect(exception))}
+      )
+
+      {:error, ProviderError.from_exception(exception), request.request_id}
+  catch
+    kind, reason ->
+      finished =
+        ProviderRequest.finish(
+          request,
+          :failed,
+          System.monotonic_time(:millisecond),
+          DateTime.utc_now()
+        )
+
+      emit(
+        state,
+        {:metrics, :request_finished,
+         Map.put(request_fact(finished), :failure_reason, inspect({kind, reason}))}
+      )
+
+      {:error, ProviderError.from_exception({kind, reason}), request.request_id}
+  end
+
+  defp reduce_summary_event(
+         %ProviderEvent{type: :content_text_delta},
+         {text, request, status, reason}
+       ) do
+    request = ProviderRequest.mark_output(request, System.monotonic_time(:millisecond), :text)
+    {:cont, {text, request, status, reason}}
+  end
+
+  defp reduce_summary_event(%ProviderEvent{type: :content_thinking_delta}, acc) do
+    {text, request, status, reason} = acc
+    request = ProviderRequest.mark_output(request, System.monotonic_time(:millisecond), :thinking)
+    {:cont, {text, request, status, reason}}
+  end
+
+  defp reduce_summary_event(%ProviderEvent{type: :usage_updated, usage: usage}, acc) do
+    {text, request, status, reason} = acc
+    {:cont, {text, put_request_usage(request, usage), status, reason}}
+  end
+
+  defp reduce_summary_event(
+         %ProviderEvent{type: :response_completed, message: message, usage: usage},
+         {_text, request, _status, _reason}
+       ) do
+    text = summary_message_text(message)
+    request = put_request_usage(request, usage || ProviderUsage.from_map(message[:usage]))
+
+    request =
+      if text == "",
+        do: request,
+        else: ProviderRequest.mark_output(request, System.monotonic_time(:millisecond), :text)
+
+    {:halt, {text, request, :completed, nil}}
+  end
+
+  defp reduce_summary_event(
+         %ProviderEvent{type: :response_failed, error: error},
+         {text, request, _, _}
+       ) do
+    status = if match?(%ProviderError{kind: :cancelled}, error), do: :cancelled, else: :failed
+    {:halt, {text, request, status, error}}
+  end
+
+  defp reduce_summary_event(_event, acc), do: {:cont, acc}
+
+  defp summary_message_text(%{content: blocks}) when is_list(blocks) do
+    Enum.map_join(blocks, "", fn
+      %{type: :text, text: text} -> text
+      _block -> ""
+    end)
+  end
+
+  defp summary_message_text(%{content: text}) when is_binary(text), do: text
+  defp summary_message_text(_message), do: ""
 
   defp resolve_policy(policy) when is_pid(policy), do: policy
   defp resolve_policy(policy) when is_atom(policy), do: policy
@@ -1699,20 +2337,34 @@ defmodule Sigma.Agent do
     max_tokens =
       Map.get(params, "maxTokens") || Map.get(params, "max_tokens") || 1024
 
-    stream_params = %{
-      model: model,
+    context = %{
       system: Map.get(params, "systemPrompt") || Map.get(params, "system_prompt"),
       messages: [%{role: :user, content: prompt}],
-      tools: [],
-      max_tokens: max_tokens,
-      options: state.provider_options
+      tools: []
     }
 
-    try do
-      events = state.provider.stream(stream_params)
+    request =
+      %{
+        model: model,
+        context: context,
+        session_id: state.session_id,
+        log_session_id: state.log_session_id,
+        origin_session_id: state.session_id,
+        turn_id: state.turn_state.turn_id,
+        purpose: :auxiliary,
+        options: Keyword.put(state.provider_options, :max_tokens, max_tokens)
+      }
+      |> ProviderRequest.new()
+      |> ProviderRequest.begin(System.monotonic_time(:millisecond), DateTime.utc_now())
 
-      case Enum.find(events, &match?({:done, _, _}, &1)) do
-        {:done, stop_reason, ai_msg} ->
+    emit(state, {:metrics, :request_started, request_fact(request)})
+
+    try do
+      {result, request} = reduce_sampling_stream(state, request)
+      emit(state, {:metrics, :request_finished, request_fact(request)})
+
+      case result do
+        {:ok, stop_reason, ai_msg} ->
           text = message_text(ai_msg)
 
           {:ok,
@@ -1723,17 +2375,76 @@ defmodule Sigma.Agent do
              "stopReason" => sampling_stop_reason(stop_reason)
            }}
 
-        nil ->
+        {:error, reason} ->
+          {:error, reason}
+
+        :missing ->
           {:error, "MCP sampling produced no completion"}
       end
     rescue
-      error -> {:error, Exception.message(error)}
+      error ->
+        emit_failed_auxiliary_request(state, request, error)
+        {:error, Exception.message(error)}
     catch
-      :exit, reason -> {:error, inspect(reason)}
+      :exit, reason ->
+        emit_failed_auxiliary_request(state, request, reason)
+        {:error, inspect(reason)}
     end
   end
 
   defp run_mcp_sampling(_state, _params), do: {:error, "Invalid sampling params"}
+
+  defp reduce_sampling_stream(state, request) do
+    {result, request} =
+      state.provider
+      |> Provider.stream(request)
+      |> Enum.reduce_while({:missing, request}, fn
+        %ProviderEvent{type: :usage_updated, usage: usage}, {result, request} ->
+          {:cont, {result, put_request_usage(request, usage)}}
+
+        %ProviderEvent{
+          type: :response_completed,
+          message: message,
+          usage: usage,
+          stop_reason: stop
+        },
+        {_result, request} ->
+          request = put_request_usage(request, usage || ProviderUsage.from_map(message[:usage]))
+          {:halt, {{:ok, stop, message}, request}}
+
+        %ProviderEvent{type: :response_failed, error: error}, {_result, request} ->
+          {:halt, {{:error, inspect(error)}, request}}
+
+        _event, acc ->
+          {:cont, acc}
+      end)
+
+    status = if match?({:ok, _, _}, result), do: :completed, else: :failed
+
+    {result,
+     ProviderRequest.finish(
+       request,
+       status,
+       System.monotonic_time(:millisecond),
+       DateTime.utc_now()
+     )}
+  end
+
+  defp emit_failed_auxiliary_request(state, request, reason) do
+    failed =
+      ProviderRequest.finish(
+        request,
+        :failed,
+        System.monotonic_time(:millisecond),
+        DateTime.utc_now()
+      )
+
+    emit(
+      state,
+      {:metrics, :request_finished,
+       Map.put(request_fact(failed), :failure_reason, inspect(reason))}
+    )
+  end
 
   defp sampling_messages_to_prompt(messages) when is_list(messages) do
     Enum.map_join(messages, "\n\n", fn
@@ -1979,6 +2690,147 @@ defmodule Sigma.Agent do
   end
 
   defp append_text_to_message(msg, _extra), do: msg
+
+  defp request_fact(%ProviderRequest{} = request) do
+    usage = request.usage && ProviderUsage.to_fact(request.usage)
+
+    %{
+      request_id: request.request_id,
+      message_id: request.message_id,
+      session_id: request.session_id,
+      origin_session_id: request.origin_session_id,
+      turn_id: request.turn_id,
+      purpose: request.purpose,
+      provider: model_value(request.model, [:provider, "provider"]),
+      model: model_value(request.model, [:id, "id", :model, "model"]),
+      revision: request.usage_revision,
+      status: request.status,
+      started_at: iso_datetime(request.started_at),
+      finished_at: iso_datetime(request.finished_at),
+      elapsed_ms: request.elapsed_ms,
+      first_output_ms: request.first_output_ms,
+      ttft_ms: request.ttft_ms,
+      input_tokens_total: usage && usage.input_tokens_total,
+      output_tokens_total: usage && usage.output_tokens_total,
+      cache_read_tokens: usage && usage.cache_read_tokens,
+      cache_write_tokens: usage && usage.cache_write_tokens,
+      reasoning_tokens: usage && usage.reasoning_tokens,
+      visible_output_tokens: usage && usage.visible_output_tokens,
+      usage_status: usage && usage.usage_status,
+      provenance: usage && usage.provenance
+    }
+  end
+
+  defp put_request_usage(request, %ProviderUsage{} = usage),
+    do: ProviderRequest.put_usage(request, usage)
+
+  defp put_request_usage(request, _usage), do: request
+
+  defp iso_datetime(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp iso_datetime(value) when is_binary(value), do: value
+  defp iso_datetime(_value), do: nil
+
+  defp model_value(model, keys) when is_map(model),
+    do: Enum.find_value(keys, &Map.get(model, &1))
+
+  defp model_value(_model, _keys), do: nil
+
+  defp refresh_context_from_assembly(state, context, source \\ :assembled_context) do
+    previous = state.context_snapshot
+
+    snapshot =
+      ContextPolicy.snapshot(
+        context_revision: next_context_revision(previous),
+        active_leaf: current_source_leaf(state) || context_active_leaf(previous),
+        model: state.model,
+        source: source,
+        system: context.system,
+        messages: context.messages,
+        tools: context.tools,
+        last_request_input_tokens: previous.last_request_input_tokens,
+        last_request_id: previous.last_request_id,
+        last_measured_at: previous.last_measured_at,
+        last_measurement_source: previous.last_measurement_source
+      )
+
+    %{
+      state
+      | context_snapshot: snapshot,
+        context_policy: context_policy(snapshot, state.model, state.provider_options)
+    }
+  end
+
+  defp refresh_context_after_request(state, %ProviderRequest{} = request) do
+    previous = state.context_snapshot
+    input_tokens = request.usage && request.usage.input_tokens
+    measured? = is_integer(input_tokens) and input_tokens >= 0
+    active_leaf = current_source_leaf(state) || context_active_leaf(previous)
+
+    snapshot =
+      ContextPolicy.snapshot(
+        context_revision: next_context_revision(previous),
+        active_leaf: active_leaf,
+        model: state.model,
+        source: if(measured?, do: :provider_usage, else: :provider_usage_unknown),
+        system_tokens: previous.estimate_components[:system],
+        message_tokens: previous.estimate_components[:messages],
+        tool_tokens: previous.estimate_components[:tools],
+        skill_tokens: previous.estimate_components[:skills],
+        attachment_tokens: previous.estimate_components[:attachments],
+        reserved_messages: previous.estimate_components[:reserved_messages],
+        next_request_estimated_input_tokens: previous.next_request_estimated_input_tokens,
+        last_request_input_tokens: input_tokens,
+        last_request_id: request.request_id,
+        last_measured_at: iso_datetime(request.finished_at),
+        last_measurement_source: if(measured?, do: :provider_usage, else: :unknown),
+        stale: not measured? or active_leaf != context_active_leaf(previous)
+      )
+
+    %{
+      state
+      | context_snapshot: snapshot,
+        context_policy: context_policy(snapshot, state.model, state.provider_options)
+    }
+  end
+
+  defp invalidate_context(state, source) do
+    previous = state.context_snapshot
+
+    snapshot =
+      ContextPolicy.invalidate(previous,
+        active_leaf: current_source_leaf(state) || context_active_leaf(previous),
+        model: state.model,
+        source: source
+      )
+
+    %{
+      state
+      | context_snapshot: snapshot,
+        context_policy: context_policy(snapshot, state.model, state.provider_options)
+    }
+  end
+
+  defp context_policy(snapshot, model, options) do
+    ContextPolicy.policy(snapshot,
+      model: model,
+      output_reserve: provider_output_reserve(options),
+      check_phase: :before_provider_dispatch
+    )
+  end
+
+  defp next_context_revision(%ContextPolicy{context_revision: revision})
+       when is_integer(revision) and revision >= 0,
+       do: revision + 1
+
+  defp next_context_revision(_snapshot), do: 1
+
+  defp context_active_leaf(%ContextPolicy{active_leaf: active_leaf}), do: active_leaf
+  defp context_active_leaf(_snapshot), do: nil
+
+  defp elapsed_since(started) when is_integer(started),
+    do: max(System.monotonic_time(:millisecond) - started, 0)
+
+  defp elapsed_since(_started), do: nil
 
   defp emit(state, event) do
     case persist_event(state.on_event, event) do

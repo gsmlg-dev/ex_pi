@@ -44,6 +44,7 @@ defmodule Sigma.Agent.SessionSupervisor do
       |> Keyword.put(:policy, policy_name)
       |> Keyword.put(:task_supervisor, tasks_name)
       |> Keyword.put(:name, agent_name)
+      |> Keyword.put(:writer, writer_name)
       |> Keyword.put(:on_event, fn event ->
         Sigma.Agent.SessionProcess.record_event(session_name, event, original_on_event)
       end)
@@ -51,49 +52,50 @@ defmodule Sigma.Agent.SessionSupervisor do
     writer_children = writer_children(opts, writer_name, transcript_path, session_id)
 
     children =
-      writer_children ++ [
-      %{
-        id: :session,
-        start:
-          {Sigma.Agent.SessionProcess, :start_link,
-           [
-             [
-               name: session_name,
-               repo_path: repo_path,
-               session_id: session_id,
-               idle_timeout_ms: Keyword.get(opts, :idle_timeout_ms, 3_600_000),
-               session_context: Keyword.get(opts, :session_context),
-               on_state_change: Keyword.get(opts, :on_state_change),
-               writer: writer_name,
-               messages: Keyword.get(opts, :messages, [])
-             ]
-           ]},
-        restart: :transient
-      },
-      %{
-        id: :permission_policy,
-        start:
-          {Sigma.Coding.PermissionPolicy, :start_link,
-           [
-             [
-               name: policy_name,
-               default: permission_config.default,
-               rules: permission_config.rules
-             ]
-           ]},
-        restart: :transient
-      },
-      %{
-        id: :task_supervisor,
-        start: {Task.Supervisor, :start_link, [[name: tasks_name]]},
-        restart: :transient
-      },
-      %{
-        id: :agent,
-        start: {Sigma.Agent, :start_link, [agent_opts]},
-        restart: :transient
-      }
-      ]
+      writer_children ++
+        [
+          %{
+            id: :session,
+            start:
+              {Sigma.Agent.SessionProcess, :start_link,
+               [
+                 [
+                   name: session_name,
+                   repo_path: repo_path,
+                   session_id: session_id,
+                   idle_timeout_ms: Keyword.get(opts, :idle_timeout_ms, 3_600_000),
+                   session_context: Keyword.get(opts, :session_context),
+                   on_state_change: Keyword.get(opts, :on_state_change),
+                   writer: writer_name,
+                   messages: Keyword.get(opts, :messages, [])
+                 ]
+               ]},
+            restart: :transient
+          },
+          %{
+            id: :permission_policy,
+            start:
+              {Sigma.Coding.PermissionPolicy, :start_link,
+               [
+                 [
+                   name: policy_name,
+                   default: permission_config.default,
+                   rules: permission_config.rules
+                 ]
+               ]},
+            restart: :transient
+          },
+          %{
+            id: :task_supervisor,
+            start: {Task.Supervisor, :start_link, [[name: tasks_name]]},
+            restart: :transient
+          },
+          %{
+            id: :agent,
+            start: {Sigma.Agent, :start_link, [agent_opts]},
+            restart: :transient
+          }
+        ]
 
     Supervisor.init(children, strategy: :one_for_all, max_restarts: 0)
   end

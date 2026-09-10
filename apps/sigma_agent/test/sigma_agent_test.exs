@@ -20,6 +20,7 @@ defmodule Sigma.AgentTest do
           output: 0,
           cache_read: 0,
           cache_write: 0,
+          visible_output: 0,
           total_tokens: 10,
           cost: %{input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0, total: 0.0}
         },
@@ -32,7 +33,7 @@ defmodule Sigma.AgentTest do
       done_msg = %{
         delta_msg
         | stop_reason: :stop,
-          usage: %{delta_msg.usage | output: 1, total_tokens: 11}
+          usage: %{delta_msg.usage | output: 1, visible_output: 1, total_tokens: 11}
       }
 
       [
@@ -161,6 +162,45 @@ defmodule Sigma.AgentTest do
 
     @impl true
     def stream(_params), do: []
+  end
+
+  defmodule BlockingStatusProvider do
+    @behaviour Sigma.Ai.Provider
+
+    @impl true
+    def stream(params) do
+      send(params.options[:test_pid], {:provider_running, self()})
+
+      receive do
+        :release_provider -> MockProvider.stream(params)
+      end
+    end
+  end
+
+  defmodule LeafWriter do
+    use GenServer
+
+    def start_link(active_leaf), do: GenServer.start_link(__MODULE__, active_leaf)
+    def put_leaf(writer, active_leaf), do: GenServer.call(writer, {:put_leaf, active_leaf})
+
+    @impl true
+    def init(active_leaf), do: {:ok, active_leaf}
+
+    @impl true
+    def handle_call(:flush, _from, active_leaf) do
+      {:reply, {:ok, %{active_leaf_id: active_leaf}}, active_leaf}
+    end
+
+    def handle_call({:put_leaf, active_leaf}, _from, _previous) do
+      {:reply, :ok, active_leaf}
+    end
+  end
+
+  defmodule RaisingRuntimeProvider do
+    @behaviour Sigma.Ai.Provider
+
+    @impl true
+    def stream(_params), do: raise("provider exploded")
   end
 
   defmodule PartialToolCallProvider do
@@ -406,15 +446,296 @@ defmodule Sigma.AgentTest do
     assert [%{type: :text, text: "Hello"}] = assistant.content
     assert assistant.stop_reason == :stop
     assert assistant.usage.total_tokens == 11
+    assert assistant.metadata.turn_id =~ "turn_"
   end
 
-  test "agent reports an error when provider returns no assistant message" do
+  test "persists one provider request fact with normalized usage and timing" do
     model = %{id: "mock-model", api: "mock-api", provider: "mock-provider"}
+    test_pid = self()
 
     {:ok, agent} =
       Sigma.Agent.start_link(
         model: model,
-        provider: EmptyProvider
+        provider: MockProvider,
+        on_event: fn event ->
+          send(test_pid, {:agent_fact, event})
+          :ok
+        end
+      )
+
+    Sigma.Agent.prompt(agent, "facts")
+
+    assert_receive {:agent_fact, {:metrics, :request_started, started}},
+                   5_000
+
+    assert is_binary(started.request_id)
+    assert started.turn_id =~ "turn_"
+    assert started.status == :running
+
+    assert_receive {:agent_fact, {:metrics, :request_finished, finished}},
+                   5_000
+
+    assert finished.request_id == started.request_id
+    assert is_binary(finished.message_id)
+    assert finished.status == :completed
+    assert finished.elapsed_ms >= 0
+    assert finished.first_output_ms >= 0
+    assert finished.ttft_ms >= 0
+    assert finished.input_tokens_total == 10
+    assert finished.output_tokens_total == 1
+    assert finished.visible_output_tokens == 1
+    assert finished.usage_status == :reported
+  end
+
+  test "publishes durable turn lifecycle facts and authoritative context state" do
+    test_pid = self()
+
+    {:ok, writer} = LeafWriter.start_link("leaf-1")
+
+    model = %{
+      id: "mock-model",
+      api: "mock-api",
+      provider: "mock-provider",
+      context_window: 100_000,
+      max_output_tokens: 1_000
+    }
+
+    {:ok, agent} =
+      Sigma.Agent.start_link(
+        session_id: "runtime-context",
+        active_leaf: "leaf-1",
+        context_revision: 7,
+        model: model,
+        provider: MockProvider,
+        writer: writer,
+        on_event: fn
+          {:message_end, %{role: :user}} = event ->
+            LeafWriter.put_leaf(writer, "leaf-user")
+            send(test_pid, {:fact, event})
+
+          {:message_end, %{role: :assistant}} = event ->
+            LeafWriter.put_leaf(writer, "leaf-assistant")
+            send(test_pid, {:fact, event})
+
+          event ->
+            send(test_pid, {:fact, event})
+        end
+      )
+
+    Sigma.Agent.subscribe(agent)
+    assert {:accepted, %{turn_id: turn_id}} = Sigma.Agent.prompt(agent, "facts")
+
+    assert_receive {:fact,
+                    {:metrics, :turn_started,
+                     %{
+                       turn_id: ^turn_id,
+                       session_id: "runtime-context",
+                       revision: 0,
+                       status: :running,
+                       reason: nil,
+                       started_at: started_at
+                     }}},
+                   5_000
+
+    assert {:ok, _started_at, 0} = DateTime.from_iso8601(started_at)
+
+    assert_receive {:fact,
+                    {:metrics, :turn_finished,
+                     %{
+                       turn_id: ^turn_id,
+                       session_id: "runtime-context",
+                       revision: 1,
+                       status: :completed,
+                       reason: nil,
+                       started_at: ^started_at,
+                       finished_at: finished_at,
+                       wall_ms: wall_ms
+                     }}},
+                   5_000
+
+    assert {:ok, _finished_at, 0} = DateTime.from_iso8601(finished_at)
+    assert is_integer(wall_ms) and wall_ms >= 0
+    assert_receive {:agent_end, _messages}, 5_000
+
+    status = Sigma.Agent.status(agent)
+
+    assert %Sigma.Agent.ContextPolicy{
+             active_leaf: active_leaf,
+             context_revision: revision,
+             model: ^model,
+             source: :provider_usage,
+             last_request_input_tokens: 10,
+             stale: true
+           } = status.context_snapshot
+
+    assert active_leaf == "leaf-assistant"
+    assert revision > 7
+    assert status.context_policy.check_phase == :before_provider_dispatch
+    assert status.context_policy.estimate_stale
+    assert status.context_policy.overflow == :within_budget
+
+    Sigma.Agent.set_model(agent, %{id: "replacement", context_window: 200_000})
+    changed = Sigma.Agent.status(agent).context_snapshot
+    assert changed.model.id == "replacement"
+    assert changed.source == :model_change
+    assert changed.stale
+  end
+
+  test "status exposes the live request until its terminal fact is accepted" do
+    test_pid = self()
+
+    {:ok, agent} =
+      Sigma.Agent.start_link(
+        session_id: "live-request-status",
+        model: %{id: "mock-model", api: "mock-api", provider: "mock-provider"},
+        provider: BlockingStatusProvider,
+        options: [test_pid: test_pid],
+        on_event: fn event -> send(test_pid, {:live_request_fact, event}) end
+      )
+
+    assert {:accepted, %{turn_id: turn_id}} = Sigma.Agent.prompt(agent, "wait")
+    assert_receive {:provider_running, provider_task}, 5_000
+
+    assert %{
+             turn_id: ^turn_id,
+             current_request_id: request_id,
+             phase: :streaming_provider
+           } = Sigma.Agent.status(agent)
+
+    assert is_binary(request_id)
+    send(provider_task, :release_provider)
+
+    assert_receive {:live_request_fact,
+                    {:metrics, :request_finished, %{request_id: ^request_id, status: :completed}}},
+                   5_000
+
+    assert_receive {:live_request_fact, {:metrics, :turn_finished, %{status: :completed}}}, 5_000
+
+    assert %{
+             current_request_id: nil,
+             context_snapshot: %{last_request_id: ^request_id}
+           } = Sigma.Agent.status(agent)
+  end
+
+  test "meters MCP sampling as an auxiliary provider request" do
+    test_pid = self()
+
+    {:ok, agent} =
+      Sigma.Agent.start_link(
+        session_id: "sampling-session",
+        model: %{id: "mock-model", api: "mock-api", provider: "mock-provider"},
+        provider: MockProvider,
+        on_event: fn event -> send(test_pid, {:sampling_fact, event}) end
+      )
+
+    assert {:ok, %{"content" => %{"text" => "Hello"}, "stopReason" => "endTurn"}} =
+             GenServer.call(
+               agent,
+               {:mcp_sampling, %{"messages" => [%{"content" => "sample this"}]}},
+               5_000
+             )
+
+    assert_receive {:sampling_fact,
+                    {:metrics, :request_started,
+                     %{request_id: request_id, purpose: :auxiliary, status: :running}}},
+                   1_000
+
+    assert_receive {:sampling_fact,
+                    {:metrics, :request_finished,
+                     %{
+                       request_id: ^request_id,
+                       purpose: :auxiliary,
+                       status: :completed,
+                       input_tokens_total: 10,
+                       output_tokens_total: 1,
+                       visible_output_tokens: 1
+                     }}},
+                   1_000
+  end
+
+  test "provider exceptions finish the same durable request as failed" do
+    model = %{id: "mock-model", api: "mock-api", provider: "mock-provider"}
+    test_pid = self()
+
+    {:ok, agent} =
+      Sigma.Agent.start_link(
+        model: model,
+        provider: RaisingRuntimeProvider,
+        on_event: fn event ->
+          send(test_pid, {:agent_fact, event})
+          :ok
+        end
+      )
+
+    Sigma.Agent.prompt(agent, "fail")
+
+    assert_receive {:agent_fact, {:metrics, :request_started, started}}, 1_000
+    assert_receive {:agent_fact, {:metrics, :request_finished, finished}}, 1_000
+    assert finished.request_id == started.request_id
+    assert finished.status == :failed
+    assert finished.elapsed_ms >= 0
+  end
+
+  test "known hard context overflow fails before provider dispatch" do
+    model = %{
+      id: "mock-model",
+      api: "mock-api",
+      provider: "mock-provider",
+      context_window: 10,
+      max_output_tokens: 8
+    }
+
+    {:ok, agent} =
+      Sigma.Agent.start_link(
+        model: model,
+        provider: CapturingProvider,
+        system_prompt: "x",
+        options: [test_pid: self()]
+      )
+
+    Sigma.Agent.subscribe(agent)
+    Sigma.Agent.prompt(agent, "This request cannot fit in ten tokens")
+
+    assert_receive {:turn_error, %Sigma.Ai.ProviderError{kind: :context_limit}}, 1_000
+    refute_receive {:provider_params, _}, 100
+    assert_receive {:agent_end, _messages}, 1_000
+  end
+
+  test "persists one tool fact at the dispatcher execution boundary" do
+    model = %{id: "mock-model", api: "mock-api", provider: "mock-provider"}
+    test_pid = self()
+
+    {:ok, agent} =
+      Sigma.Agent.start_link(
+        model: model,
+        provider: PromptDispatcherProvider,
+        tools: [PromptDispatcherTool],
+        dispatcher_opts: [test_pid: test_pid],
+        on_event: fn event ->
+          send(test_pid, {:agent_fact, event})
+          :ok
+        end
+      )
+
+    Sigma.Agent.prompt(agent, "tool facts")
+
+    assert_receive {:agent_fact, {:metrics, :tool_finished, fact}}, 1_000
+    assert fact.tool_id == "tc_prompt_opts"
+    assert fact.turn_id =~ "turn_"
+    assert fact.status == :completed
+    assert is_integer(fact.elapsed_ms) and fact.elapsed_ms >= 0
+    refute_receive {:agent_fact, {:metrics, :tool_finished, _}}, 100
+  end
+
+  test "agent reports an error when provider returns no assistant message" do
+    model = %{id: "mock-model", api: "mock-api", provider: "mock-provider"}
+    test_pid = self()
+
+    {:ok, agent} =
+      Sigma.Agent.start_link(
+        model: model,
+        provider: EmptyProvider,
+        on_event: fn event -> send(test_pid, {:empty_provider_fact, event}) end
       )
 
     Sigma.Agent.subscribe(agent)
@@ -425,6 +746,8 @@ defmodule Sigma.AgentTest do
                       kind: :malformed_stream,
                       message: "stream_ended_without_terminal"
                     }}
+
+    assert_receive {:empty_provider_fact, {:metrics, :request_finished, %{status: :failed}}}
 
     assert_receive {:agent_end, [%Message{role: :user, content: "Hi"}]}
   end
@@ -734,6 +1057,17 @@ defmodule Sigma.AgentTest do
     end
   end
 
+  defmodule CompactFailingSummaryProvider do
+    @behaviour Sigma.Ai.Provider
+
+    @impl true
+    def stream(%{purpose: :compaction}) do
+      [{:provider_error, Sigma.Ai.ProviderError.from_reason(:upstream_error)}]
+    end
+
+    def stream(params), do: CompactMockProvider.stream(params)
+  end
+
   test "triggers compaction when input usage exceeds threshold" do
     model = %{id: "mock-model", api: "mock-api", provider: "mock-provider"}
 
@@ -750,6 +1084,84 @@ defmodule Sigma.AgentTest do
     assert_receive {:compact, %Message{role: :compaction_summary}, _first_kept_id}, 3000
     assert_receive {:agent_end, messages}, 3000
     assert Enum.any?(messages, &(&1.role == :compaction_summary))
+
+    assert %{context_snapshot: %{source: :compaction, stale: false}} = Sigma.Agent.status(agent)
+  end
+
+  test "records durable compaction start and commit facts" do
+    test_pid = self()
+
+    {:ok, agent} =
+      Sigma.Agent.start_link(
+        model: %{id: "mock-model", api: "mock-api", provider: "mock-provider"},
+        provider: CompactMockProvider,
+        messages: compact_pre_messages(),
+        on_event: fn event -> send(test_pid, {:agent_event, event}) end
+      )
+
+    Sigma.Agent.prompt(agent, "Hi")
+
+    assert_receive {:agent_event,
+                    {:metrics, :compaction,
+                     %{compaction_id: compaction_id, revision: 0, status: :started}}},
+                   3_000
+
+    assert_receive {:agent_event,
+                    {:metrics, :request_started,
+                     %{request_id: request_id, purpose: :compaction, status: :running}}},
+                   3_000
+
+    assert_receive {:agent_event,
+                    {:metrics, :compaction,
+                     %{
+                       compaction_id: ^compaction_id,
+                       revision: 1,
+                       status: :committed,
+                       summary_id: summary_id,
+                       request_ids: [^request_id],
+                       after_source: :estimated
+                     }}},
+                   3_000
+
+    assert is_binary(summary_id)
+    assert is_binary(request_id)
+
+    assert_receive {:agent_event,
+                    {:metrics, :request_finished,
+                     %{
+                       request_id: ^request_id,
+                       purpose: :compaction,
+                       status: :completed,
+                       input_tokens_total: 0,
+                       output_tokens_total: 5
+                     }}},
+                   3_000
+  end
+
+  test "links a failed compaction provider request to the failed compaction fact" do
+    test_pid = self()
+
+    {:ok, agent} =
+      Sigma.Agent.start_link(
+        model: %{id: "mock-model", api: "mock-api", provider: "mock-provider"},
+        provider: CompactFailingSummaryProvider,
+        messages: compact_pre_messages(),
+        on_event: fn event -> send(test_pid, {:agent_event, event}) end
+      )
+
+    Sigma.Agent.prompt(agent, "Hi")
+
+    assert_receive {:agent_event,
+                    {:metrics, :request_finished,
+                     %{request_id: request_id, purpose: :compaction, status: :failed}}},
+                   3_000
+
+    assert_receive {:agent_event,
+                    {:metrics, :compaction,
+                     %{status: :failed, request_ids: [^request_id], failure_reason: reason}}},
+                   3_000
+
+    assert reason =~ "upstream_error"
   end
 
   test "does not compact below a large model context window" do
