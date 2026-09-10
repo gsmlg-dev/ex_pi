@@ -76,6 +76,11 @@ el-dm-dialog [slot="footer"] {
   min-width: 0;
 }
 
+el-dm-button:focus-within {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
 .sigma-session-main {
   min-width: 0;
   min-height: 0;

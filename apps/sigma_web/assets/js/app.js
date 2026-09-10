@@ -5,6 +5,8 @@ import topbar from "topbar"
 import * as DuskmoonHooks from "phoenix_duskmoon/hooks"
 import { Terminal } from "@xterm/xterm"
 import { encodeImageFiles } from "./chat_attachments.js"
+import { shouldClearComposer } from "./chat_submission.js"
+import { formatElapsedTime, formatRelativeTime } from "./session_time.js"
 
 import "./duskmoon_elements.js"
 
@@ -283,7 +285,7 @@ const DEFAULT_SLASH_COMMANDS = [
 ]
 const SLASH_COMMAND_MENU_KEYS = ['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape']
 
-// Adds Cmd+Enter support and slash-command completion to el-dm-chat-input.
+// Adds Cmd/Ctrl+Enter support and slash-command completion to el-dm-chat-input.
 // Use: phx-hook="ChatInputHook" on a wrapper element containing the el-dm-chat-input.
 const ChatInputHook = {
   mounted() {
@@ -294,6 +296,7 @@ const ChatInputHook = {
     this._filteredCommands = []
     this._activeIndex = 0
     this._editorBindings = []
+    this._draftKey = `sigma:composer-draft:${window.location.pathname}`
     this._buildMenu()
 
     this._keyHandler = (e) => {
@@ -302,12 +305,15 @@ const ChatInputHook = {
         return
       }
 
-      if (e.key === 'Enter' && e.metaKey && !e.shiftKey) {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.shiftKey) {
         e.preventDefault()
         this._chatInput._send()
       }
     }
-    this._inputHandler = () => this._syncMenu()
+    this._inputHandler = () => {
+      this._persistDraft()
+      this._syncMenu()
+    }
     this._editorKeyHandler = (e) => {
       if (this._menuOpen && SLASH_COMMAND_MENU_KEYS.includes(e.key)) {
         this._handleMenuKey(e)
@@ -330,7 +336,16 @@ const ChatInputHook = {
     if (this._chatInput.shadowRoot) {
       this._editorObserver.observe(this._chatInput.shadowRoot, { childList: true, subtree: true })
     }
-    this._editorFrame = window.requestAnimationFrame(() => this._bindEditorEvents())
+    this._editorFrame = window.requestAnimationFrame(() => {
+      this._bindEditorEvents()
+      this._restoreDraft()
+    })
+  },
+  updated() {
+    this._restoreDraft()
+  },
+  reconnected() {
+    window.requestAnimationFrame(() => this._restoreDraft())
   },
   destroyed() {
     if (this._chatInput && this._keyHandler) {
@@ -402,6 +417,21 @@ const ChatInputHook = {
     }
     this._chatInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }))
   },
+  _draftValue() {
+    return this._getMarkdownInput()?.shadowRoot?.querySelector('textarea')?.value ?? this._getValue()
+  },
+  _persistDraft() {
+    const value = this._draftValue()
+    if (value) {
+      window.sessionStorage.setItem(this._draftKey, value)
+    } else {
+      window.sessionStorage.removeItem(this._draftKey)
+    }
+  },
+  _restoreDraft() {
+    const draft = window.sessionStorage.getItem(this._draftKey)
+    if (draft && !this._draftValue()) this._setValue(draft)
+  },
   async _handleSend(event) {
     if (this._submitting) return
 
@@ -424,7 +454,7 @@ const ChatInputHook = {
     }
 
     this.pushEvent("send_prompt", { value, images: result.images }, (reply) => {
-      if (["accepted", "queued_as_steering", "queued_as_follow_up"].includes(reply?.status)) {
+      if (shouldClearComposer(reply)) {
         this._setValue("")
         this._chatInput.clearFiles?.()
       }
@@ -543,25 +573,52 @@ const ChatInputHook = {
 const ScrollBottom = {
   mounted() {
     this.atBottom = true
+    this.jumpButton = document.createElement('button')
+    this.jumpButton.type = 'button'
+    this.jumpButton.textContent = 'Jump to latest'
+    this.jumpButton.setAttribute('aria-label', 'Jump to latest message')
+    this.jumpButton.className = 'sigma-jump-to-latest hidden sticky bottom-3 z-10 mx-auto rounded-md border border-outline-variant bg-surface px-3 py-2 text-xs font-semibold text-on-surface shadow-lg'
+    this.jumpButton.addEventListener('click', () => {
+      this.atBottom = true
+      this.scrollToBottom()
+      this._renderJumpButton()
+    })
+    this._ensureJumpButton()
+
     this.el.addEventListener("scroll", () => {
       const {scrollTop, scrollHeight, clientHeight} = this.el
       this.atBottom = (scrollHeight - scrollTop - clientHeight < 50)
+      this._ensureJumpButton()
+      this._renderJumpButton()
     })
 
     this.observer = new MutationObserver(() => {
-      if (this.atBottom) this.scrollToBottom()
+      this._ensureJumpButton()
+      if (this.atBottom) {
+        this.scrollToBottom()
+      } else {
+        this._renderJumpButton()
+      }
     })
     this.observer.observe(this.el, { childList: true, subtree: true })
     this.scrollToBottom()
   },
   updated() {
+    this._ensureJumpButton()
     if (this.atBottom) this.scrollToBottom()
   },
   destroyed() {
     if (this.observer) this.observer.disconnect()
+    this.jumpButton?.remove()
   },
   scrollToBottom() {
     this.el.scrollTo({ top: this.el.scrollHeight, behavior: 'auto' })
+  },
+  _ensureJumpButton() {
+    if (!this.jumpButton?.isConnected) this.el.appendChild(this.jumpButton)
+  },
+  _renderJumpButton() {
+    this.jumpButton?.classList.toggle('hidden', this.atBottom)
   }
 }
 
@@ -577,6 +634,30 @@ const LocalTime = {
     const pad = (n, z = 2) => String(n).padStart(z, '0')
     this.el.textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`
   }
+}
+
+const RelativeTime = {
+  mounted() {
+    this._render = () => {
+      this.el.textContent = formatRelativeTime(this.el.dataset.ts)
+    }
+    this._render()
+    this._timer = window.setInterval(this._render, 1_000)
+  },
+  updated() { this._render?.() },
+  destroyed() { window.clearInterval(this._timer) }
+}
+
+const ElapsedTime = {
+  mounted() {
+    this._render = () => {
+      this.el.textContent = formatElapsedTime(this.el.dataset.ts)
+    }
+    this._render()
+    this._timer = window.setInterval(this._render, 1_000)
+  },
+  updated() { this._render?.() },
+  destroyed() { window.clearInterval(this._timer) }
 }
 
 const WebShellTerminal = {
@@ -651,7 +732,7 @@ let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("
 
 let liveSocket = new LiveSocket("/live", Socket, {
   params: {_csrf_token: csrfToken},
-  hooks: { ...DuskmoonHooks, ModalHook, ScrollBottom, AutocompleteHook, SessionMenuHook, ChatInputHook, MarkdownInputHook, AppearanceThemeHook, LocalTime, WebShellTerminal }
+  hooks: { ...DuskmoonHooks, ModalHook, ScrollBottom, AutocompleteHook, SessionMenuHook, ChatInputHook, MarkdownInputHook, AppearanceThemeHook, LocalTime, RelativeTime, ElapsedTime, WebShellTerminal }
 })
 
 // Show progress bar on live navigation and form submits

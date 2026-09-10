@@ -3,7 +3,7 @@ defmodule Sigma.Web.Layouts.AppTest do
 
   import Phoenix.LiveViewTest
 
-  test "renders appbar tooltips with native hint popovers" do
+  test "renders accessible appbar actions without overflow-prone hint popovers" do
     html =
       render_component(&Sigma.Web.Layouts.app/1, %{
         active_tab: :home,
@@ -15,25 +15,14 @@ defmodule Sigma.Web.Layouts.AppTest do
 
     document = LazyHTML.from_document(html)
 
-    for {id, label} <- [
-          {"appbar-home-tooltip", "Home"},
-          {"appbar-settings-tooltip", "Settings"},
-          {"appbar-debug-logs-tooltip", "Debug Logs"}
-        ] do
+    for label <- ["Home", "Settings", "Debug Logs"] do
       assert document
-             |> LazyHTML.query(
-               "[interestfor='#{id}'][aria-describedby='#{id}'][title='#{label}'][style*='anchor-name: --#{id}']"
-             )
-             |> Enum.any?()
-
-      assert document
-             |> LazyHTML.query(
-               "##{id}[popover='hint'][role='tooltip'][style*='position-anchor: --#{id}'].tooltip.tooltip-bottom"
-             )
-             |> LazyHTML.text()
-             |> String.trim() == label
+             |> LazyHTML.query("[aria-label='#{label}'][title='#{label}']")
+             |> Enum.count() == 1
     end
 
-    refute html =~ "tooltip-content"
+    refute document
+           |> LazyHTML.query("[popover='hint'], [interestfor]")
+           |> Enum.any?()
   end
 end

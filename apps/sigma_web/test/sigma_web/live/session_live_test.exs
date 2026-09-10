@@ -48,6 +48,39 @@ defmodule Sigma.Web.SessionLiveTest do
     end
   end
 
+  defmodule ManualCompactionProvider do
+    @behaviour Sigma.Ai.Provider
+
+    @impl true
+    def stream(%{purpose: :compaction}) do
+      message = %{
+        role: :assistant,
+        content: [%{type: :text, text: "Compact session summary"}],
+        model: "mock-model",
+        provider: "mock-provider",
+        usage: %{input: 20, output: 3, total_tokens: 23},
+        stop_reason: :stop,
+        timestamp: System.system_time(:millisecond)
+      }
+
+      [{:start, %{message | content: []}}, {:done, :stop, message}]
+    end
+
+    def stream(%{purpose: :turn}) do
+      message = %{
+        role: :assistant,
+        content: [%{type: :text, text: "Context measured"}],
+        model: "mock-model",
+        provider: "mock-provider",
+        usage: %{input: 100_000, output: 1, total_tokens: 100_001},
+        stop_reason: :stop,
+        timestamp: System.system_time(:millisecond)
+      }
+
+      [{:start, %{message | content: []}}, {:done, :stop, message}]
+    end
+  end
+
   defmodule CaptureProvider do
     @behaviour Sigma.Ai.Provider
 
@@ -81,7 +114,8 @@ defmodule Sigma.Web.SessionLiveTest do
           ]
         end
 
-      stop_reason = if last_message && last_message.role == :tool_result, do: :stop, else: :tool_use
+      stop_reason =
+        if last_message && last_message.role == :tool_result, do: :stop, else: :tool_use
 
       message = %{
         role: :assistant,
@@ -112,6 +146,7 @@ defmodule Sigma.Web.SessionLiveTest do
     def stream(params) do
       test_pid = Application.fetch_env!(:sigma_web, :blocking_provider_pid)
       cancellation_ref = Keyword.fetch!(params.options, :cancellation_ref)
+
       prompt =
         params.context.messages
         |> List.last()
@@ -127,7 +162,9 @@ defmodule Sigma.Web.SessionLiveTest do
       send(test_pid, {:web_provider_waiting, self(), prompt})
 
       receive do
-        :release_web_provider -> Sigma.Web.MockProvider.stream(params)
+        :release_web_provider ->
+          Sigma.Web.MockProvider.stream(params)
+
         {:cancel, ^cancellation_ref} ->
           [{:provider_error, Sigma.Ai.ProviderError.from_reason(:cancelled)}]
       end
@@ -179,9 +216,10 @@ defmodule Sigma.Web.SessionLiveTest do
   end
 
   test "renders session page", %{conn: conn} do
-    {:ok, _view, html} = live_loaded(conn, session_path(unique_session_id("render")))
+    {:ok, view, html} = live_loaded(conn, session_path(unique_session_id("render")))
     assert html =~ "Ask ∑ anything"
-    assert html =~ "⌘/Ctrl+Enter to send"
+    refute html =~ "Enter sends"
+    refute html =~ "Ctrl+Enter to send"
     assert html =~ ~s(id="prompt-input")
     assert html =~ ~s(phx-hook="ChatInputHook")
     assert html =~ "/init"
@@ -192,8 +230,13 @@ defmodule Sigma.Web.SessionLiveTest do
     assert html =~ "New Session"
     assert html =~ "Terminal"
     assert html =~ ~s(id="web-shell-open-btn")
+    assert html =~ ~s(id="session-observability-open-btn")
     assert html =~ ~s(href="/repository/#{@encoded_workdir}/skills")
     assert_session_sidebar_order(html)
+
+    drawer_html = render_click(view, "toggle_observability")
+    assert drawer_html =~ ~s(id="session-observability-drawer")
+    assert drawer_html =~ ~s(aria-label="Close session observability")
   end
 
   @tag :tmp_dir
@@ -204,11 +247,15 @@ defmodule Sigma.Web.SessionLiveTest do
       write_session_start_hook!(@workdir, "sleep 2", timeout: 3)
 
       {:ok, view, _html} = live(conn, session_path(unique_session_id("slow-start")))
-      html = render_async(view, 1000)
+      html = render(view)
 
       assert html =~ "Ask ∑ anything"
       refute html =~ "Could not load session"
       refute html =~ "pending_user_questions"
+
+      loaded_html = render_async(view, 4_000)
+      assert loaded_html =~ "Ask ∑ anything"
+      refute loaded_html =~ "Could not load session"
     end)
   end
 
@@ -223,6 +270,13 @@ defmodule Sigma.Web.SessionLiveTest do
       |> Floki.find("#prompt-input")
 
     refute has_attr?(prompt_input, "disabled")
+
+    [compact_button] =
+      html
+      |> Floki.parse_document!()
+      |> Floki.find("#compact-session-btn")
+
+    assert has_attr?(compact_button, "disabled")
   end
 
   test "renders session menu anchors with selector-safe session ids", %{conn: conn} do
@@ -328,17 +382,31 @@ defmodule Sigma.Web.SessionLiveTest do
     :ok =
       Sigma.Session.Log.persist_event(source_path, {:message_end, Message.user("m1", "hello")})
 
+    :ok =
+      Sigma.Session.Log.persist_event(
+        source_path,
+        {:message_end, Message.assistant("m2", %{content: "done"})}
+      )
+
     File.write!(Path.join(sessions_dir, "fork_collision_1.jsonl"), "existing 1\n")
     File.write!(Path.join(sessions_dir, "fork_collision_2.jsonl"), "existing 2\n")
 
     with_fork_id_generator(~w(fork_collision_1 fork_collision_2 fork_success), fn ->
       {:ok, view, _html} = live_loaded(conn, session_path(session_id))
 
+      html =
+        render_hook(view, "session_menu_action", %{
+          "value" => "fork",
+          "session" => session_id
+        })
+
+      assert html =~ ~s(id="fork-session-modal")
+
       assert {:error,
               {:live_redirect, %{to: "/repository/#{@encoded_workdir}/sessions/fork_success"}}} =
-               render_hook(view, "session_menu_action", %{
-                 "value" => "fork",
-                 "session" => session_id
+               render_submit(view, "confirm_fork", %{
+                 "title" => "Fork after collisions",
+                 "switch" => "true"
                })
     end)
 
@@ -729,8 +797,91 @@ defmodule Sigma.Web.SessionLiveTest do
         assert_receive {:agent_end, _messages}, 3000
         refute_receive {:compact, %Message{role: :compaction_summary}, _first_kept_id}, 200
 
+        assert_eventually(fn ->
+          html = render(view)
+          html =~ "input: 90000" and html =~ "output: 1" and html =~ "Turn total"
+        end)
+
         assert {:ok, messages} = Sigma.Session.Log.replay(storage_path)
         refute Enum.any?(messages, &(&1.role == :compaction_summary))
+      end)
+    end)
+  end
+
+  @tag :tmp_dir
+  test "manual compaction lowers live context while durable usage survives restart", %{
+    conn: conn,
+    tmp_dir: tmp_dir
+  } do
+    with_agent_config(tmp_dir, fn ->
+      with_mock_provider(ManualCompactionProvider, fn ->
+        write_provider_configs("openai", "smart", %{
+          "openai" => [%{"id" => "smart", "contextWindow" => 1_000_000}]
+        })
+
+        session_id = unique_session_id("manual-context")
+        storage_path = preload_compactable_history(session_id)
+
+        Enum.each(12..23, fn index ->
+          content = String.duplicate("long context #{index} ", 500)
+
+          assert :ok =
+                   Log.persist_event(
+                     storage_path,
+                     {:message_end, Message.user("u#{index}", content)}
+                   )
+
+          assert :ok =
+                   Log.persist_event(
+                     storage_path,
+                     {:message_end,
+                      Message.assistant("a#{index}", %{content: "processed #{index} #{content}"})}
+                   )
+        end)
+
+        assert :ok =
+                 Log.persist_event(
+                   storage_path,
+                   {:metrics, :request_finished,
+                    %{
+                      request_id: "historical-request",
+                      session_id: session_id,
+                      revision: 1,
+                      status: :completed,
+                      input_tokens_total: 106_976,
+                      output_tokens_total: 0,
+                      elapsed_ms: 1_000
+                    }}
+                 )
+
+        Phoenix.PubSub.subscribe(Sigma.Web.PubSub, session_topic(@workdir, session_id))
+        {:ok, view, _html} = live_loaded(conn, session_path(session_id))
+
+        {:ok, {agent, _policy}} =
+          Sigma.Web.SessionManager.get_agent(session_id, repo_path: @workdir)
+
+        render_submit(view, "send_prompt", %{"value" => "measure before compaction"})
+        assert_receive {:agent_end, _messages}, 3_000
+
+        before_context =
+          Sigma.Agent.status(agent).context_snapshot.next_request_estimated_input_tokens
+
+        assert is_integer(before_context)
+        render_click(view, "compact_session")
+
+        html = render_async(view, 2_000)
+        assert html =~ "successful: 1"
+        assert html =~ "known total: 207000"
+
+        after_context =
+          Sigma.Agent.status(agent).context_snapshot.next_request_estimated_input_tokens
+
+        assert after_context < before_context
+
+        stop_repository_supervisors(@workdir)
+        {:ok, _reloaded_view, reloaded_html} = live_loaded(conn, session_path(session_id))
+        assert reloaded_html =~ "successful: 1"
+        assert reloaded_html =~ "known total: 207000"
       end)
     end)
   end
@@ -932,7 +1083,7 @@ defmodule Sigma.Web.SessionLiveTest do
         assert html =~ "Wait for the active turn to finish before switching sessions."
 
         html = render_hook(view, "fork_session", %{})
-        assert html =~ "Wait for the active turn to finish before forking this session."
+        assert html =~ "Wait for the active turn to finish before forking."
         refute File.exists?(session_storage_path("busy_fork_target"))
 
         send(provider, :release_web_provider)
@@ -950,9 +1101,7 @@ defmodule Sigma.Web.SessionLiveTest do
     {:ok, view, _html} = live_loaded(conn, session_path(session_id))
     expected_path = "/repository/#{@encoded_workdir}/sessions/#{target_id}"
 
-    assert {:error,
-            {:live_redirect,
-             %{to: ^expected_path}}} =
+    assert {:error, {:live_redirect, %{to: ^expected_path}}} =
              render_hook(view, "switch_session", %{"session" => target_id})
   end
 
@@ -1066,7 +1215,7 @@ defmodule Sigma.Web.SessionLiveTest do
     assert html =~ ~s(align="start")
     assert html =~ ~s(color="secondary")
     assert html =~ ~s(id="retry-msg_user_left")
-    assert html =~ "Retry"
+    assert html =~ "Resend"
     refute html =~ ~s(variant="filled")
   end
 
@@ -1241,11 +1390,11 @@ defmodule Sigma.Web.SessionLiveTest do
     assert html =~ ~s(data-ts="1779379527686")
   end
 
-  test "renders latest session context size below the chat box", %{conn: conn} do
+  test "does not infer context size from an assistant message", %{conn: conn} do
     {:ok, view, html} = live_loaded(conn, session_path(unique_session_id("context_size")))
 
-    assert html =~ ~s(id="session-context-size")
-    assert html =~ "Context: 0 tokens"
+    assert html =~ ~s(id="session-context-size-unknown")
+    assert html =~ "Context: unknown"
 
     message = %Sigma.Agent.Message{
       id: "msg_context_size",
@@ -1265,24 +1414,20 @@ defmodule Sigma.Web.SessionLiveTest do
     send(view.pid, {:message_end, message})
 
     html = render(view)
-    assert html =~ "Context: ~12.3K tokens"
-    assert html =~ ~s(title="12,345 tokens")
+    assert html =~ ~s(id="session-context-size-unknown")
+    assert html =~ "Context: unknown"
   end
 
-  test "keeps session context size readable and monotonic", %{conn: conn} do
-    {:ok, view, _html} = live_loaded(conn, session_path(unique_session_id("context_monotonic")))
+  test "does not let replayed message usage replace runtime context", %{conn: conn} do
+    {:ok, view, _html} =
+      live_loaded(conn, session_path(unique_session_id("context_runtime_owned")))
 
     send(view.pid, {:message_end, assistant_usage_message("large", 12_345)})
-    assert render(view) =~ "Context: ~12.3K tokens"
-
     send(view.pid, {:message_end, assistant_usage_message("small", 105)})
-    assert render(view) =~ "Context: ~12.3K tokens"
-
-    send(view.pid, {:message_end, assistant_usage_message("larger", 15_200)})
-    assert render(view) =~ "Context: ~15.2K tokens"
+    assert render(view) =~ "Context: unknown"
   end
 
-  test "keeps session context size monotonic after replay", %{conn: conn} do
+  test "keeps context unknown when journal replay only has message usage", %{conn: conn} do
     session_id = unique_session_id("context_replay")
     storage_path = session_storage_path(session_id)
     File.mkdir_p!(Path.dirname(storage_path))
@@ -1301,7 +1446,216 @@ defmodule Sigma.Web.SessionLiveTest do
 
     {:ok, _view, html} = live_loaded(conn, session_path(session_id))
 
-    assert html =~ "Context: ~12.3K tokens"
+    assert html =~ "Context: unknown"
+  end
+
+  test "projects durable metric facts into the live session rail", %{conn: conn} do
+    session_id = unique_session_id("live_metrics")
+    {:ok, view, _html} = live_loaded(conn, session_path(session_id))
+
+    send(view.pid, {
+      :metrics,
+      :request_started,
+      %{
+        request_id: "req_live",
+        session_id: session_id,
+        revision: 0,
+        turn_id: "turn_live"
+      }
+    })
+
+    send(view.pid, {
+      :metrics,
+      :request_finished,
+      %{
+        request_id: "req_live",
+        session_id: session_id,
+        revision: 1,
+        turn_id: "turn_live",
+        status: :completed,
+        input_tokens_total: 120,
+        output_tokens_total: 30,
+        elapsed_ms: 1_000
+      }
+    })
+
+    assert_eventually(fn ->
+      html = render(view)
+      html =~ "Usage" and html =~ "150" and html =~ "coverage: 1/1"
+    end)
+  end
+
+  test "restores persisted usage as owned by the logical route session", %{conn: conn} do
+    session_id = unique_session_id("persisted_metrics")
+    storage_path = session_storage_path(session_id)
+    File.mkdir_p!(Path.dirname(storage_path))
+
+    assert :ok = Sigma.Session.Log.persist_event(storage_path, {:agent_start, @workdir})
+
+    assert :ok =
+             Sigma.Session.Log.persist_event(
+               storage_path,
+               {:metrics, :request_finished,
+                %{
+                  request_id: "persisted-request",
+                  session_id: session_id,
+                  revision: 1,
+                  status: :completed,
+                  input_tokens_total: 75,
+                  output_tokens_total: 25,
+                  elapsed_ms: 1_000
+                }}
+             )
+
+    {:ok, _view, html} = live_loaded(conn, session_path(session_id))
+    assert html =~ "known total: 100"
+    refute html =~ "inherited: 100 tokens"
+  end
+
+  test "offers checkpoint Retry separately from Resend and requires confirmation", %{conn: conn} do
+    session_id = unique_session_id("retry_confirmation")
+    storage_path = session_storage_path(session_id)
+    File.mkdir_p!(Path.dirname(storage_path))
+    user = %{Message.user("retry-user", "try again") | metadata: %{turn_id: "original-turn"}}
+
+    assert :ok = Log.persist_event(storage_path, {:agent_start, @workdir})
+    assert :ok = Log.persist_event(storage_path, {:message_end, user})
+
+    assert :ok =
+             Log.persist_event(
+               storage_path,
+               {:message_end, Message.assistant("retry-answer", %{content: "old answer"})}
+             )
+
+    {:ok, view, html} = live_loaded(conn, session_path(session_id))
+    assert html =~ ~s(id="retry-turn-retry-user")
+    assert html =~ ~s(id="retry-retry-user")
+
+    modal_html = render_click(view, "prepare_retry", %{"msg-id" => "retry-user"})
+    assert modal_html =~ ~s(id="retry-turn-modal")
+    assert modal_html =~ "Retry once"
+    assert modal_html =~ "do not roll back files"
+
+    closed_html = render_click(view, "cancel_retry")
+    refute closed_html =~ ~s(id="retry-turn-modal")
+  end
+
+  test "Fork requires confirmation and can create without switching", %{conn: conn} do
+    session_id = unique_session_id("fork_confirmation")
+    target_id = unique_session_id("fork_target")
+
+    with_fork_id_generator([target_id], fn ->
+      {:ok, view, _html} = live_loaded(conn, session_path(session_id))
+
+      modal_html = render_click(view, "fork_session")
+      assert modal_html =~ ~s(id="fork-session-modal")
+      assert modal_html =~ "latest completed turn"
+      assert modal_html =~ "Target title"
+      assert modal_html =~ "shared workspaces remain shared"
+
+      html =
+        render_submit(view, "confirm_fork", %{
+          "title" => "Alternative investigation",
+          "switch" => "false"
+        })
+
+      refute html =~ ~s(id="fork-session-modal")
+      assert html =~ "Fork created without starting a model request."
+
+      assert {:ok, meta_path} =
+               Sigma.Session.SessionFiles.meta_path(
+                 Sigma.Session.ConfigManager.sessions_dir(@workdir),
+                 target_id
+               )
+
+      assert Jason.decode!(File.read!(meta_path))["title"] == "Alternative investigation"
+    end)
+  end
+
+  test "confirming Retry navigates and reloads the replacement branch", %{conn: conn} do
+    session_id = unique_session_id("retry_branch_reload")
+    path = session_path(session_id)
+    storage_path = session_storage_path(session_id)
+    File.mkdir_p!(Path.dirname(storage_path))
+
+    first = %{Message.user("retry-first", "first prompt") | metadata: %{turn_id: "turn-first"}}
+
+    second = %{
+      Message.user("retry-second", "second prompt")
+      | metadata: %{turn_id: "turn-second"}
+    }
+
+    assert :ok = Log.persist_event(storage_path, {:agent_start, @workdir})
+    assert :ok = Log.persist_event(storage_path, {:message_end, first})
+
+    assert :ok =
+             Log.persist_event(
+               storage_path,
+               {:message_end, Message.assistant("first-answer", %{content: "first answer"})}
+             )
+
+    assert :ok = Log.persist_event(storage_path, {:message_end, second})
+
+    assert :ok =
+             Log.persist_event(
+               storage_path,
+               {:message_end, Message.assistant("second-answer", %{content: "second answer"})}
+             )
+
+    {:ok, view, _html} = live_loaded(conn, path)
+    assert render_click(view, "prepare_retry", %{"msg-id" => "retry-first"}) =~ "Retry once"
+    render_click(view, "confirm_retry")
+    assert_redirect(view, path)
+
+    assert_eventually(fn ->
+      case Log.snapshot(storage_path) do
+        {:ok, snapshot} ->
+          Enum.any?(snapshot.messages, fn message ->
+            message.role == :user and
+              (message.metadata[:retry_of_turn_id] || message.metadata["retry_of_turn_id"]) ==
+                "turn-first"
+          end)
+
+        _ ->
+          false
+      end
+    end)
+
+    assert_eventually(fn ->
+      case Log.branch_summaries(storage_path) do
+        {:ok, [active, original]} ->
+          active.active? and active.retry_of_turn_id == "turn-first" and
+            get_in(active, [:last_assistant, :text]) == "I am a mock response." and
+            not original.active? and
+            get_in(original, [:last_assistant, :text]) == "second answer"
+
+        _other ->
+          false
+      end
+    end)
+
+    {:ok, _reloaded_view, reloaded_html} = live_loaded(conn, path)
+    assert reloaded_html =~ "first prompt"
+
+    transcript_text =
+      reloaded_html
+      |> Floki.parse_document!()
+      |> Floki.find("#messages")
+      |> Floki.text()
+
+    refute transcript_text =~ "second prompt"
+    assert reloaded_html =~ "Alternative executions"
+    assert reloaded_html =~ "Original execution"
+    assert reloaded_html =~ "second answer"
+    assert reloaded_html =~ "I am a mock response."
+    assert reloaded_html =~ "turn-first"
+
+    assert {:ok, entries} = Sigma.Session.Storage.JsonlFile.read(storage_path)
+    assert Enum.any?(entries, &(get_in(&1, ["message", "id"]) == "second-answer"))
+
+    assert Enum.count(entries, fn entry ->
+             get_in(entry, ["message", "metadata", "retry_of_turn_id"]) == "turn-first"
+           end) == 1
   end
 
   test "renders and answers an AskUserQuestion request", %{conn: conn} do
@@ -1421,7 +1775,7 @@ defmodule Sigma.Web.SessionLiveTest do
             options: ["Fast", "Accurate"],
             allow_freeform: true
           },
-          timeout: 1_000
+          timeout: 5_000
         )
       end)
 
@@ -1582,12 +1936,19 @@ defmodule Sigma.Web.SessionLiveTest do
         log_filter: nil,
         log_search: "",
         model_options: [],
+        branch_summaries: [],
         pending_mcp_elicitations: [],
+        pending_compaction: false,
+        pending_fork: nil,
+        pending_retry: nil,
         pending_user_questions: [],
+        parent_session_id: nil,
+        runtime_status: :idle,
         session_id: "render_session",
         session_ready: true,
         sessions: [],
         show_logs: false,
+        show_observability: false,
         show_web_shell: false,
         storage_path: session_storage_path("render_session"),
         streaming_message_id: nil,
@@ -1603,7 +1964,7 @@ defmodule Sigma.Web.SessionLiveTest do
 
   defp live_loaded(conn, path) do
     {:ok, view, _html} = live(conn, path)
-    {:ok, view, render_async(view, 1_000)}
+    {:ok, view, render_async(view, 3_000)}
   end
 
   defp session_topic(workdir, session_id) do

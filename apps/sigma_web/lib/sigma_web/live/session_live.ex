@@ -8,6 +8,7 @@ defmodule Sigma.Web.SessionLive do
   alias Sigma.Session.Skills
   alias Sigma.Session.SlashCommands
   alias Sigma.Web.ImageAttachments
+  alias Sigma.Web.SessionObservability
   alias Phoenix.LiveView.AsyncResult
 
   @fork_id_attempts 5
@@ -181,18 +182,37 @@ defmodule Sigma.Web.SessionLive do
                ),
              {:ok, sessions} <- Sigma.Session.Log.list_session_summaries(sessions_dir) do
           agent = runtime_session.agent
+          runtime_status = Sigma.Agent.Runtime.session_status(workdir, session_id)
+          agent_status = Sigma.Agent.status(agent)
 
           pending_user_questions = load_pending_user_questions(agent)
           model_options = model_options(system_config, provider_id)
           current_model_value = model_option_value(provider_id, model_id)
           {stream_messages, tool_results, tool_call_to_msg} = split_messages(initial_messages)
+          session_metrics_state = ensure_metrics_session(snapshot.metrics, session_id)
+          session_metrics = Sigma.Session.Metrics.snapshot(session_metrics_state)
+          context_snapshot = agent_status.context_snapshot
+          context_policy = agent_status.context_policy
+          branch_summaries = load_branch_summaries(snapshot, storage_path)
 
           {:ok,
            %{
              active_provider_id: provider_id,
              agent: agent,
-             context_token_count: latest_context_token_count(initial_messages),
-             context_window: model_context_window(selected_agent_model),
+             context_snapshot: context_snapshot,
+             current_request_id: agent_status.current_request_id,
+             context_token_count: context_display_tokens(context_snapshot),
+             context_window: context_policy[:context_window],
+             session_metrics: session_metrics,
+             session_metrics_state: session_metrics_state,
+             context_policy: context_policy,
+             branch_summaries: branch_summaries,
+             parent_session_id: snapshot.parent_session_id,
+             runtime_status:
+               runtime_phase(
+                 agent_status.phase,
+                 session_process_runtime_status(runtime_status.status)
+               ),
              current_model: model_id,
              current_model_value: current_model_value,
              context_diagnostics: context_discovery.diagnostics,
@@ -216,7 +236,8 @@ defmodule Sigma.Web.SessionLive do
 
   @impl true
   def handle_async(:session_load, {:ok, {:ok, session_data}}, socket) do
-    agent_ref = Process.monitor(session_data.agent)
+    agent = session_data.agent
+    agent_ref = Process.monitor(agent)
 
     socket =
       socket
@@ -226,6 +247,14 @@ defmodule Sigma.Web.SessionLive do
       |> assign(:agent_ref, agent_ref)
       |> assign(:context_token_count, session_data.context_token_count)
       |> assign(:context_window, session_data.context_window)
+      |> assign(:context_snapshot, session_data.context_snapshot)
+      |> assign(:current_request_id, session_data.current_request_id)
+      |> assign(:session_metrics, session_data.session_metrics)
+      |> assign(:session_metrics_state, session_data.session_metrics_state)
+      |> assign(:context_policy, session_data.context_policy)
+      |> assign(:branch_summaries, session_data.branch_summaries)
+      |> assign(:parent_session_id, session_data.parent_session_id)
+      |> assign(:runtime_status, session_data.runtime_status)
       |> assign(:current_model, session_data.current_model)
       |> assign(:current_model_value, session_data.current_model_value)
       |> assign(:context_diagnostics, session_data.context_diagnostics)
@@ -237,9 +266,11 @@ defmodule Sigma.Web.SessionLive do
       |> assign(:pending_mcp_elicitations, session_data.pending_mcp_elicitations)
       |> assign(:sessions, session_data.sessions)
       |> assign(:session_ready, true)
+      |> assign(:turn_in_flight, active_runtime_phase?(session_data.runtime_status))
       |> assign(:tool_call_to_msg, session_data.tool_call_to_msg)
       |> assign(:tool_results, session_data.tool_results)
       |> stream(:messages, session_data.stream_messages, reset: true)
+      |> start_async(:agent_status, fn -> Sigma.Agent.status(agent) end)
 
     {:noreply, socket}
   end
@@ -265,6 +296,38 @@ defmodule Sigma.Web.SessionLive do
      |> assign(:session_load, AsyncResult.failed(socket.assigns.session_load, {:exit, reason}))
      |> put_flash(:error, "Could not load session: #{format_load_error(reason)}")}
   end
+
+  def handle_async(:manual_compaction, {:ok, {:ok, _result}}, socket) do
+    {:noreply,
+     socket
+     |> assign(pending_compaction: false, runtime_status: :idle)
+     |> put_flash(:info, "Context compacted.")}
+  end
+
+  def handle_async(:manual_compaction, {:ok, {:error, reason}}, socket) do
+    {:noreply,
+     socket
+     |> assign(pending_compaction: false, runtime_status: :idle)
+     |> put_flash(:error, compact_error_message(reason))}
+  end
+
+  def handle_async(:manual_compaction, {:exit, reason}, socket) do
+    {:noreply,
+     socket
+     |> assign(pending_compaction: false, runtime_status: :idle)
+     |> put_flash(:error, "Compaction failed: #{inspect(reason)}")}
+  end
+
+  def handle_async(:agent_status, {:ok, %{phase: phase} = status}, socket) do
+    phase =
+      if active_runtime_phase?(socket.assigns.runtime_status) and not active_runtime_phase?(phase),
+        do: socket.assigns.runtime_status,
+        else: phase
+
+    {:noreply, apply_agent_status(socket, %{status | phase: phase})}
+  end
+
+  def handle_async(:agent_status, _result, socket), do: {:noreply, socket}
 
   @impl true
   def render(assigns) do
@@ -351,6 +414,12 @@ defmodule Sigma.Web.SessionLive do
               >
                 <.dm_mdi name="chat-outline" class="h-4 w-4 shrink-0 opacity-70" />
                 <span class="truncate text-xs font-mono" title={session_id}>{s.title}</span>
+                <.dm_mdi
+                  :if={s[:parent_session_id]}
+                  name="source-branch"
+                  class="h-3 w-3 shrink-0 opacity-70"
+                  title={"Forked from #{s.parent_session_id}"}
+                />
               </.dm_link>
               <.dm_btn
                 :if={not is_renaming and session_id != @session_id}
@@ -364,6 +433,12 @@ defmodule Sigma.Web.SessionLive do
               >
                 <.dm_mdi name="chat-outline" class="h-4 w-4 shrink-0 opacity-70" />
                 <span class="truncate text-xs font-mono" title={session_id}>{s.title}</span>
+                <.dm_mdi
+                  :if={s[:parent_session_id]}
+                  name="source-branch"
+                  class="h-3 w-3 shrink-0 opacity-70"
+                  title={"Forked from #{s.parent_session_id}"}
+                />
               </.dm_btn>
               <.dm_btn
                 :if={not is_renaming}
@@ -442,6 +517,7 @@ defmodule Sigma.Web.SessionLive do
               </form>
 
               <span
+                :if={is_integer(@context_window) and @context_window > 0}
                 id="session-context-size"
                 class={["sigma-context-gauge", context_usage_class(@context_token_count, @context_window)]}
                 title={format_context_size_title(@context_token_count, @context_window)}
@@ -457,14 +533,16 @@ defmodule Sigma.Web.SessionLive do
                   Context: {format_context_size(@context_token_count, @context_window)}
                 </span>
               </span>
-
               <span
-                interestfor="web-shell-open-tooltip"
-                aria-describedby="web-shell-open-tooltip"
-                title="Terminal"
-                style="anchor-name: --web-shell-open-tooltip"
-                class="inline-flex"
+                :if={not (is_integer(@context_window) and @context_window > 0)}
+                id="session-context-size-unknown"
+                class="sigma-session-chip"
+                title="The selected model does not report a context window"
               >
+                Context: unknown
+              </span>
+
+              <span title="Open terminal" class="inline-flex">
                 <.dm_btn
                   id="web-shell-open-btn"
                   type="button"
@@ -473,19 +551,44 @@ defmodule Sigma.Web.SessionLive do
                   variant="ghost"
                   size="sm"
                   shape="circle"
+                  aria-label="Open terminal"
                 >
                   <.dm_mdi name="console-line" class="h-4 w-4" />
+                  <span class="sr-only">Open terminal</span>
                 </.dm_btn>
               </span>
-              <div
-                id="web-shell-open-tooltip"
-                popover="hint"
-                role="tooltip"
-                class="tooltip tooltip-bottom"
-                style="position-anchor: --web-shell-open-tooltip"
+
+              <.dm_btn
+                id="compact-session-btn"
+                type="button"
+                phx-click="compact_session"
+                phx-hook="WebComponentHook"
+                variant="ghost"
+                size="sm"
+                shape="circle"
+                disabled={not @session_ready or @turn_in_flight or @pending_compaction}
+                title="Compact context"
+                aria-label="Compact context"
               >
-                Open terminal
-              </div>
+                <.dm_mdi name="arrow-collapse-vertical" class="h-4 w-4" />
+                <span class="sr-only">Compact context</span>
+              </.dm_btn>
+
+              <.dm_btn
+                id="session-observability-open-btn"
+                type="button"
+                phx-click="toggle_observability"
+                phx-hook="WebComponentHook"
+                variant="ghost"
+                size="sm"
+                shape="circle"
+                class="xl:hidden"
+                title="Session observability"
+                aria-label="Open session observability"
+              >
+                <.dm_mdi name="chart-box-outline" class="h-4 w-4" />
+                <span class="sr-only">Open session observability</span>
+              </.dm_btn>
             </div>
           </div>
         </header>
@@ -503,6 +606,7 @@ defmodule Sigma.Web.SessionLive do
               streaming_message_id={@streaming_message_id}
               session_ready={@session_ready}
               turn_in_flight={@turn_in_flight}
+              session_metrics={@session_metrics}
             />
           </div>
         </div>
@@ -548,7 +652,7 @@ defmodule Sigma.Web.SessionLive do
             <div :if={@turn_in_flight} class="mb-3 flex items-center justify-between gap-3">
               <div class="flex items-center gap-3 text-sm text-on-surface-variant">
                 <.dm_chat_typing />
-                <span>Agent is working…</span>
+                <span>{runtime_phase_label(@runtime_status)}</span>
               </div>
               <.dm_btn
                 id="cancel-turn-btn"
@@ -568,17 +672,14 @@ defmodule Sigma.Web.SessionLive do
               <.dm_chat_input
                 id="prompt-input"
                 phx-update="ignore"
-                placeholder="Ask ∑ anything… (⌘/Ctrl+Enter to send)"
+                placeholder="Ask ∑ anything…"
                 disabled={false}
                 clear_on_send={false}
               />
             </div>
 
-            <div class="mt-3 flex items-center justify-between gap-4 text-[11px] text-on-surface-variant">
-              <span class="font-mono opacity-50">
-                Enter sends. Shift+Enter adds a line.
-              </span>
-              <p class="opacity-60 text-right ml-auto">
+            <div class="mt-3 flex items-center justify-end text-[11px] text-on-surface-variant">
+              <p class="opacity-60 text-right">
                 ∑ is an AI agent. Review its work carefully.
               </p>
             </div>
@@ -634,7 +735,151 @@ defmodule Sigma.Web.SessionLive do
             </p>
           </div>
         </div>
+
+        <SessionObservability.session_overview_rail snapshot={session_observability_snapshot(assigns)} />
+        <SessionObservability.context_budget_card policy={context_budget_view(assigns)} />
+        <SessionObservability.branch_alternatives branches={@branch_summaries} />
       </aside>
+
+      <button
+        :if={@show_observability}
+        id="session-observability-backdrop"
+        type="button"
+        phx-click="toggle_observability"
+        class="absolute inset-0 z-20 bg-scrim/40 xl:hidden"
+        aria-label="Close session observability"
+      />
+      <aside
+        :if={@show_observability}
+        id="session-observability-drawer"
+        class="absolute inset-y-0 right-0 z-30 flex w-[min(22rem,calc(100vw-2rem))] flex-col overflow-y-auto border-l border-outline-variant bg-surface-container-high p-4 text-on-surface shadow-xl xl:hidden"
+        aria-label="Session observability drawer"
+      >
+        <header class="mb-4 flex items-center justify-between gap-3 border-b border-outline-variant pb-3">
+          <h2 class="text-sm font-semibold">Session observability</h2>
+          <.dm_btn
+            id="session-observability-close-btn"
+            type="button"
+            phx-click="toggle_observability"
+            phx-hook="WebComponentHook"
+            variant="ghost"
+            size="sm"
+            shape="circle"
+            aria-label="Close session observability"
+          >
+            <.dm_mdi name="close" class="h-4 w-4" />
+            <span class="sr-only">Close session observability</span>
+          </.dm_btn>
+        </header>
+        <SessionObservability.session_overview_rail snapshot={session_observability_snapshot(assigns)} />
+        <div class="mt-4">
+          <SessionObservability.context_budget_card policy={context_budget_view(assigns)} />
+        </div>
+        <div class="mt-4">
+          <SessionObservability.branch_alternatives branches={@branch_summaries} />
+        </div>
+      </aside>
+
+      <.dm_modal :if={@pending_retry} id="retry-turn-modal" phx-hook="ModalHook">
+        <:title>
+          <div class="flex items-center gap-2">
+            <.dm_mdi name="backup-restore" class="h-5 w-5" />
+            <span>Retry turn</span>
+          </div>
+        </:title>
+        <:body>
+          <p class="text-sm text-on-surface">
+            Start one replacement turn from the selected prompt checkpoint? The original branch remains in the journal.
+          </p>
+          <div class="mt-3">
+            <SessionObservability.side_effect_warning />
+          </div>
+        </:body>
+        <:footer>
+          <.dm_btn
+            id="cancel-retry-turn-btn"
+            type="button"
+            phx-click="cancel_retry"
+            phx-hook="WebComponentHook"
+            variant="ghost"
+          >
+            Cancel
+          </.dm_btn>
+          <.dm_btn
+            id="confirm-retry-turn-btn"
+            type="button"
+            phx-click="confirm_retry"
+            phx-hook="WebComponentHook"
+            variant="primary"
+          >
+            Retry once
+          </.dm_btn>
+        </:footer>
+      </.dm_modal>
+
+      <.dm_modal :if={@pending_fork} id="fork-session-modal" phx-hook="ModalHook">
+        <:title>
+          <div class="flex items-center gap-2">
+            <.dm_mdi name="source-branch" class="h-5 w-5" />
+            <span>Fork session</span>
+          </div>
+        </:title>
+        <:body>
+          <form id="fork-session-form" phx-submit="confirm_fork" class="space-y-4">
+            <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2 text-xs">
+              <dt class="text-on-surface-variant">Source</dt>
+              <dd class="truncate font-mono" title={@pending_fork.source_session_id}>
+                {@pending_fork.source_session_id}
+              </dd>
+              <dt class="text-on-surface-variant">Boundary</dt>
+              <dd class="break-all font-mono">{fork_boundary_label(@pending_fork)}</dd>
+              <dt class="text-on-surface-variant">Model</dt>
+              <dd class="break-all font-mono">{display_model(@pending_fork.provider_id, @pending_fork.model_id)}</dd>
+              <dt class="text-on-surface-variant">Workdir</dt>
+              <dd class="break-all font-mono">{@pending_fork.cwd}</dd>
+            </dl>
+
+            <label class="block text-sm font-medium text-on-surface" for="fork-target-title">
+              Target title
+            </label>
+            <input
+              id="fork-target-title"
+              name="title"
+              value={@pending_fork.target_title}
+              maxlength="120"
+              required
+              class="w-full rounded-md border border-outline-variant bg-surface-container-low px-3 py-2 text-sm text-on-surface focus:border-primary focus:outline-none"
+            />
+
+            <label class="flex items-center gap-2 text-sm text-on-surface" for="fork-switch">
+              <input id="fork-switch" type="checkbox" name="switch" value="true" checked />
+              Switch to the new session after creating it
+            </label>
+
+            <SessionObservability.side_effect_warning />
+
+            <div class="flex justify-end gap-2">
+              <.dm_btn
+                id="cancel-fork-session-btn"
+                type="button"
+                phx-click="cancel_fork"
+                phx-hook="WebComponentHook"
+                variant="ghost"
+              >
+                Cancel
+              </.dm_btn>
+              <.dm_btn
+                id="confirm-fork-session-btn"
+                type="submit"
+                phx-hook="WebComponentHook"
+                variant="primary"
+              >
+                Create fork
+              </.dm_btn>
+            </div>
+          </form>
+        </:body>
+      </.dm_modal>
 
       <.web_shell_panel
         :if={@show_web_shell}
@@ -929,6 +1174,21 @@ defmodule Sigma.Web.SessionLive do
       </div>
 
       <:actions_slot>
+        <SessionObservability.side_effect_warning />
+        <.dm_btn
+          :if={retryable_message?(@message)}
+          id={"retry-turn-#{@message.id}"}
+          phx-click="prepare_retry"
+          phx-value-msg-id={@message.id}
+          phx-hook="WebComponentHook"
+          variant="ghost"
+          size="xs"
+          disabled={not @session_ready or @turn_in_flight}
+          title="Retry from this turn checkpoint"
+        >
+          <:prefix><.dm_mdi name="backup-restore" class="w-3 h-3" /></:prefix>
+          Retry
+        </.dm_btn>
         <.dm_btn
           id={"retry-#{@message.id}"}
           phx-click="retry_message"
@@ -937,10 +1197,10 @@ defmodule Sigma.Web.SessionLive do
           variant="ghost"
           size="xs"
           disabled={not @session_ready or @turn_in_flight}
-          title="Retry message"
+          title="Resend as new turn"
         >
           <:prefix><.dm_mdi name="refresh" class="w-3 h-3" /></:prefix>
-          Retry
+          Resend
         </.dm_btn>
       </:actions_slot>
     </.dm_chat>
@@ -948,13 +1208,18 @@ defmodule Sigma.Web.SessionLive do
   end
 
   defp message_bubble(%{message: %{role: :assistant}} = assigns) do
-    content = List.wrap(assigns.message.content)
+    content = assistant_content_blocks(assigns.message.content)
 
     assigns =
       assigns
       |> assign(:thinking, Enum.find(content, &(&1.type == :thinking)))
       |> assign(:texts, Enum.filter(content, &(&1.type == :text)))
       |> assign(:tool_calls, Enum.filter(content, &(&1.type == :tool_call)))
+      |> assign(
+        :request_metrics,
+        request_metrics_for(assigns.message, assigns[:session_metrics])
+      )
+      |> assign(:turn_summary, turn_summary_for(assigns.message, assigns[:session_metrics]))
 
     ~H"""
     <.dm_chat
@@ -1002,10 +1267,14 @@ defmodule Sigma.Web.SessionLive do
 
       <.dm_markdown :for={block <- @texts} content={block.text} />
 
-      <:footer :if={not is_nil(@message.usage)}>
-        <span class="text-[10px] opacity-40 font-mono">
-          in: {@message.usage.input} · out: {@message.usage.output}
-        </span>
+      <:footer :if={@request_metrics != [] or not is_nil(@turn_summary)}>
+        <SessionObservability.message_metrics_footer
+          :for={request <- @request_metrics}
+          metrics={request}
+          elapsed_ms={request[:elapsed_ms]}
+          status={request[:status]}
+        />
+        <SessionObservability.turn_summary :if={not is_nil(@turn_summary)} summary={@turn_summary} />
       </:footer>
       <:actions_slot>
         <.dm_btn
@@ -1016,8 +1285,10 @@ defmodule Sigma.Web.SessionLive do
           variant="ghost"
           size="xs"
           title="Fork session from here"
+          aria-label="Fork session from here"
         >
           <.dm_mdi name="source-branch" class="w-3 h-3" />
+          <span class="sr-only">Fork session from here</span>
         </.dm_btn>
       </:actions_slot>
     </.dm_chat>
@@ -1039,6 +1310,22 @@ defmodule Sigma.Web.SessionLive do
   end
 
   defp message_bubble(assigns), do: ~H""
+
+  defp assistant_content_blocks(content) when is_binary(content),
+    do: [%{type: :text, text: content}]
+
+  defp assistant_content_blocks(content) when is_list(content), do: content
+
+  defp turn_summary_for(%{stop_reason: :tool_use}, _session_metrics), do: nil
+
+  defp turn_summary_for(%{metadata: metadata}, session_metrics)
+       when is_map(metadata) and is_map(session_metrics) do
+    turn_id = metadata[:turn_id] || metadata["turn_id"]
+    turns = session_metrics[:turns] || session_metrics["turns"] || %{}
+    Map.get(turns, turn_id)
+  end
+
+  defp turn_summary_for(_message, _session_metrics), do: nil
 
   defp local_time(assigns) do
     assigns = assign(assigns, :dom_id, "#{assigns.id}-local-time")
@@ -1144,28 +1431,36 @@ defmodule Sigma.Web.SessionLive do
     ts |> DateTime.from_unix!(:millisecond) |> Calendar.strftime("%H:%M:%S")
   end
 
-  defp latest_context_token_count(messages) do
-    messages
-    |> Enum.map(&message_context_token_count/1)
-    |> Enum.reject(&is_nil/1)
-    |> Enum.max(fn -> 0 end)
+  defp message_metrics(usage) when is_map(usage) do
+    %{
+      input_tokens_total: Map.get(usage, :input) || Map.get(usage, "input"),
+      output_tokens_total: Map.get(usage, :output) || Map.get(usage, "output")
+    }
   end
 
-  defp message_context_token_count(%{role: :assistant, usage: usage}) when is_map(usage) do
-    non_negative_integer(Map.get(usage, :input) || Map.get(usage, "input"))
-  end
+  defp request_metrics_for(message, session_metrics) when is_map(session_metrics) do
+    requests = session_metrics[:requests] || session_metrics["requests"] || %{}
 
-  defp message_context_token_count(_message), do: nil
+    durable =
+      requests
+      |> Map.values()
+      |> Enum.filter(&(&1.message_id == message.id))
+      |> Enum.sort_by(&{&1.started_at || "", &1.request_id})
 
-  defp assign_context_token_count(socket, message) do
-    case message_context_token_count(message) do
-      nil ->
-        socket
+    case {durable, message.usage} do
+      {[], usage} when is_map(usage) ->
+        [
+          message_metrics(usage)
+          |> Map.put(:status, :unknown)
+          |> Map.put(:usage_status, :legacy)
+        ]
 
-      count ->
-        assign(socket, :context_token_count, max(socket.assigns.context_token_count, count))
+      _ ->
+        durable
     end
   end
+
+  defp request_metrics_for(_message, _session_metrics), do: []
 
   defp format_context_size(count, nil),
     do: "#{format_token_count(non_negative_integer(count) || 0)} tokens"
@@ -1173,9 +1468,6 @@ defmodule Sigma.Web.SessionLive do
   defp format_context_size(count, context_window) do
     "#{format_token_count(non_negative_integer(count) || 0)} / #{format_token_count(context_window)} tokens"
   end
-
-  defp format_context_size_title(count, nil),
-    do: "#{format_integer(non_negative_integer(count) || 0)} tokens"
 
   defp format_context_size_title(count, context_window) do
     "#{format_integer(non_negative_integer(count) || 0)} / #{format_integer(context_window)} tokens"
@@ -1200,6 +1492,37 @@ defmodule Sigma.Web.SessionLive do
       nil -> 0
       window -> count |> Kernel.*(100) |> Kernel./(window) |> min(100) |> max(0) |> round()
     end
+  end
+
+  defp runtime_phase_label(:waiting_provider), do: "Waiting for provider…"
+  defp runtime_phase_label(:streaming_provider), do: "Receiving model output…"
+  defp runtime_phase_label(:running_tools), do: "Running tools…"
+  defp runtime_phase_label(:waiting_permission), do: "Waiting for approval…"
+  defp runtime_phase_label(:waiting_elicitation), do: "Waiting for input…"
+  defp runtime_phase_label(:cancelling), do: "Cancelling…"
+  defp runtime_phase_label(:compacting), do: "Compacting context…"
+  defp runtime_phase_label(:queued), do: "Queued…"
+  defp runtime_phase_label(_phase), do: "Agent is working…"
+
+  defp fork_boundary_label(%{message_id: :all}), do: "latest completed turn"
+
+  defp fork_boundary_label(%{message_id: message_id, boundary_turn_id: turn_id}) do
+    if is_binary(turn_id), do: "turn #{turn_id}", else: "message #{message_id}"
+  end
+
+  defp display_model(provider_id, model_id) when is_binary(provider_id) and is_binary(model_id),
+    do: "#{provider_id}/#{model_id}"
+
+  defp display_model(_provider_id, _model_id), do: "unknown"
+
+  defp fork_boundary_turn_id(_messages, :all), do: nil
+
+  defp fork_boundary_turn_id(messages, message_id) do
+    Enum.find_value(messages, fn message ->
+      if message.id == message_id and is_map(message.metadata) do
+        message.metadata[:turn_id] || message.metadata["turn_id"]
+      end
+    end)
   end
 
   defp session_status_class(false, _turn_in_flight), do: "is-loading"
@@ -1526,6 +1849,13 @@ defmodule Sigma.Web.SessionLive do
     end
   end
 
+  defp retryable_message?(%{role: :user, metadata: metadata}) when is_map(metadata) do
+    turn_id = metadata[:turn_id] || metadata["turn_id"]
+    is_binary(turn_id) and turn_id != ""
+  end
+
+  defp retryable_message?(_message), do: false
+
   defp retry_prompt_content(content) when is_binary(content) do
     case String.trim(content) do
       "" -> {:error, :not_retryable}
@@ -1567,12 +1897,59 @@ defmodule Sigma.Web.SessionLive do
 
   @impl true
   def handle_event("fork_session", _, socket) do
-    do_fork(socket, :all)
+    prepare_fork(socket, socket.assigns.session_id, :all)
   end
 
   @impl true
   def handle_event("fork_at", %{"msg-id" => msg_id}, socket) do
-    do_fork(socket, {:at, msg_id})
+    prepare_fork(socket, socket.assigns.session_id, {:at, msg_id})
+  end
+
+  def handle_event("cancel_fork", _params, socket) do
+    {:noreply, assign(socket, :pending_fork, nil)}
+  end
+
+  def handle_event("confirm_fork", _params, %{assigns: %{pending_fork: nil}} = socket) do
+    {:noreply, socket}
+  end
+
+  def handle_event("confirm_fork", params, socket) do
+    pending = socket.assigns.pending_fork
+    title = params |> Map.get("title", "") |> String.trim()
+
+    if title == "" do
+      {:noreply, put_flash(socket, :error, "Enter a title for the new session.")}
+    else
+      opts = [
+        operation_id: pending.operation_id,
+        expected_source_revision: pending.expected_source_revision,
+        expected_source_leaf: pending.expected_source_leaf,
+        title: title
+      ]
+
+      case fork_with_new_id(socket, pending.source_session_id, pending.message_id, opts) do
+        {:ok, new_id} ->
+          socket = assign(socket, :pending_fork, nil)
+
+          if params["switch"] == "true" do
+            {:noreply, handle_fork_result(socket, {:ok, new_id})}
+          else
+            {:ok, sessions} =
+              Sigma.Session.Log.list_session_summaries(socket.assigns.sessions_dir)
+
+            {:noreply,
+             socket
+             |> assign(:sessions, sessions)
+             |> put_flash(:info, "Fork created without starting a model request.")}
+          end
+
+        {:error, reason} ->
+          {:noreply,
+           socket
+           |> assign(:pending_fork, nil)
+           |> handle_fork_result({:error, reason})}
+      end
+    end
   end
 
   @impl true
@@ -1615,7 +1992,7 @@ defmodule Sigma.Web.SessionLive do
         {:noreply, assign(socket, :renaming_session, s)}
 
       "fork" ->
-        {:noreply, handle_fork_result(socket, fork_with_new_id(socket, s, :all))}
+        prepare_fork(socket, s, :all)
 
       "archive" ->
         {:noreply, put_flash(socket, :info, "Archive not yet implemented")}
@@ -1710,7 +2087,7 @@ defmodule Sigma.Web.SessionLive do
       :ok
     end
 
-    {:noreply, socket}
+    {:noreply, assign(socket, :runtime_status, :cancelling)}
   end
 
   @impl true
@@ -1789,6 +2166,74 @@ defmodule Sigma.Web.SessionLive do
   end
 
   @impl true
+  def handle_event("prepare_retry", %{"msg-id" => msg_id}, socket) do
+    cond do
+      not session_ready?(socket) ->
+        {:noreply, put_flash(socket, :info, "Session is still loading.")}
+
+      socket.assigns.turn_in_flight ->
+        {:noreply, put_flash(socket, :info, "Agent is still working.")}
+
+      true ->
+        case Sigma.Session.Log.retry_checkpoint(socket.assigns.storage_path, msg_id) do
+          {:ok, checkpoint} ->
+            pending = %{
+              message_id: msg_id,
+              operation_id: new_operation_id("retry"),
+              expected_source_revision: checkpoint.source_revision,
+              expected_source_leaf: checkpoint.source_leaf_id
+            }
+
+            {:noreply, assign(socket, :pending_retry, pending)}
+
+          {:error, reason} ->
+            {:noreply, put_flash(socket, :error, retry_error_message(reason))}
+        end
+    end
+  end
+
+  def handle_event("cancel_retry", _params, socket) do
+    {:noreply, assign(socket, :pending_retry, nil)}
+  end
+
+  def handle_event("confirm_retry", _params, %{assigns: %{pending_retry: nil}} = socket) do
+    {:noreply, socket}
+  end
+
+  def handle_event("confirm_retry", _params, socket) do
+    pending = socket.assigns.pending_retry
+
+    result =
+      Sigma.Agent.Runtime.retry_turn(
+        socket.assigns.workdir,
+        socket.assigns.session_id,
+        socket.assigns.sessions_dir,
+        pending.message_id,
+        operation_id: pending.operation_id,
+        expected_source_revision: pending.expected_source_revision,
+        expected_source_leaf: pending.expected_source_leaf
+      )
+
+    case result do
+      {:ok, _retry} ->
+        {:noreply,
+         socket
+         |> assign(:pending_retry, nil)
+         |> put_flash(:info, "Retry started from the selected checkpoint.")
+         |> push_navigate(
+           to:
+             ~p"/repository/#{socket.assigns.encoded_repository}/sessions/#{socket.assigns.session_id}"
+         )}
+
+      {:error, reason} ->
+        {:noreply,
+         socket
+         |> assign(:pending_retry, nil)
+         |> put_flash(:error, retry_error_message(reason))}
+    end
+  end
+
+  @impl true
   def handle_event("open_web_shell", _params, socket) do
     cond do
       not session_ready?(socket) ->
@@ -1843,6 +2288,51 @@ defmodule Sigma.Web.SessionLive do
   @impl true
   def handle_event("toggle_logs", _params, socket) do
     {:noreply, assign(socket, :show_logs, !socket.assigns.show_logs)}
+  end
+
+  def handle_event("toggle_observability", _params, socket) do
+    {:noreply, assign(socket, :show_observability, !socket.assigns.show_observability)}
+  end
+
+  def handle_event("compact_session", _params, socket) do
+    cond do
+      not socket.assigns.session_ready ->
+        {:noreply, put_flash(socket, :error, "Wait for the session to finish loading.")}
+
+      socket.assigns.turn_in_flight or socket.assigns.pending_compaction ->
+        {:noreply, put_flash(socket, :error, "Wait for the active operation to finish first.")}
+
+      true ->
+        operation_id = new_operation_id("compact")
+        workdir = socket.assigns.workdir
+        session_id = socket.assigns.session_id
+        sessions_dir = socket.assigns.sessions_dir
+
+        case Sigma.Session.Log.snapshot(socket.assigns.storage_path) do
+          {:ok, snapshot} ->
+            expected_revision =
+              length(snapshot.branch_entry_ids) + if(is_map(snapshot.header), do: 1, else: 0)
+
+            socket =
+              socket
+              |> assign(pending_compaction: true, runtime_status: :compacting)
+              |> start_async(:manual_compaction, fn ->
+                Sigma.Agent.Runtime.compact_session(
+                  workdir,
+                  session_id,
+                  sessions_dir,
+                  operation_id: operation_id,
+                  expected_source_revision: expected_revision,
+                  expected_source_leaf: snapshot.active_leaf_id
+                )
+              end)
+
+            {:noreply, socket}
+
+          {:error, reason} ->
+            {:noreply, put_flash(socket, :error, compact_error_message(reason))}
+        end
+    end
   end
 
   @impl true
@@ -1905,13 +2395,17 @@ defmodule Sigma.Web.SessionLive do
       ConfigManager.set_active_provider(provider_id)
       ConfigManager.update_provider(provider_id, %{"model" => model_id})
 
-      {:noreply,
-       assign(socket,
-         active_provider_id: provider_id,
-         current_model: model_id,
-         current_model_value: selected,
-         context_window: model_context_window(selected_agent_model)
-       )}
+      socket =
+        assign(socket,
+          active_provider_id: provider_id,
+          current_model: model_id,
+          current_model_value: selected,
+          context_window: model_context_window(selected_agent_model),
+          context_token_count: nil
+        )
+
+      agent = socket.assigns.agent
+      {:noreply, start_async(socket, :agent_status, fn -> Sigma.Agent.status(agent) end)}
     else
       {:error, {:model_change_persistence_failed, _reason}} ->
         {:noreply, put_flash(socket, :error, "Could not persist model selection.")}
@@ -2074,7 +2568,22 @@ defmodule Sigma.Web.SessionLive do
 
   @impl true
   def handle_info({:agent_start, _cwd}, socket) do
-    {:noreply, assign(socket, :turn_in_flight, true)}
+    {:noreply, assign(socket, turn_in_flight: true, runtime_status: :streaming_provider)}
+  end
+
+  @impl true
+  def handle_info({:turn_start}, socket) do
+    {:noreply, assign(socket, turn_in_flight: true, runtime_status: :streaming_provider)}
+  end
+
+  @impl true
+  def handle_info({:tool_execution_start, _id, _name, _arguments}, socket) do
+    {:noreply, assign(socket, :runtime_status, :running_tools)}
+  end
+
+  @impl true
+  def handle_info({:approval_required, _id, _name}, socket) do
+    {:noreply, assign(socket, :runtime_status, :waiting_permission)}
   end
 
   @impl true
@@ -2083,8 +2592,21 @@ defmodule Sigma.Web.SessionLive do
   end
 
   @impl true
+  def handle_info({:turn_completed, _turn_id}, socket) do
+    {:noreply,
+     assign(socket, turn_in_flight: false, streaming_message_id: nil, runtime_status: :completed)}
+  end
+
+  @impl true
+  def handle_info({:turn_failed, _turn_id}, socket) do
+    {:noreply,
+     assign(socket, turn_in_flight: false, streaming_message_id: nil, runtime_status: :failed)}
+  end
+
+  @impl true
   def handle_info({:turn_cancelled}, socket) do
-    {:noreply, assign(socket, turn_in_flight: false, streaming_message_id: nil)}
+    {:noreply,
+     assign(socket, turn_in_flight: false, streaming_message_id: nil, runtime_status: :cancelled)}
   end
 
   @impl true
@@ -2094,7 +2616,7 @@ defmodule Sigma.Web.SessionLive do
     {:noreply,
      socket
      |> put_flash(:error, "Turn failed: #{msg}")
-     |> assign(turn_in_flight: false, streaming_message_id: nil)}
+     |> assign(turn_in_flight: false, streaming_message_id: nil, runtime_status: :failed)}
   end
 
   @impl true
@@ -2104,12 +2626,18 @@ defmodule Sigma.Web.SessionLive do
       |> normalize_user_question_request()
       |> Map.put(:id, question_id)
 
-    {:noreply, update(socket, :pending_user_questions, &upsert_user_question(&1, question))}
+    {:noreply,
+     socket
+     |> assign(:runtime_status, :waiting_permission)
+     |> update(:pending_user_questions, &upsert_user_question(&1, question))}
   end
 
   @impl true
   def handle_info({:ask_user_question_resolved, question_id}, socket) do
-    {:noreply, update(socket, :pending_user_questions, &remove_user_question(&1, question_id))}
+    {:noreply,
+     socket
+     |> assign(:runtime_status, resumed_runtime_status(socket))
+     |> update(:pending_user_questions, &remove_user_question(&1, question_id))}
   end
 
   @impl true
@@ -2117,13 +2645,17 @@ defmodule Sigma.Web.SessionLive do
     elicitation = Map.put(request, :id, elicitation_id)
 
     {:noreply,
-     update(socket, :pending_mcp_elicitations, &upsert_mcp_elicitation(&1, elicitation))}
+     socket
+     |> assign(:runtime_status, :waiting_elicitation)
+     |> update(:pending_mcp_elicitations, &upsert_mcp_elicitation(&1, elicitation))}
   end
 
   @impl true
   def handle_info({:mcp_elicitation_resolved, elicitation_id}, socket) do
     {:noreply,
-     update(socket, :pending_mcp_elicitations, &remove_mcp_elicitation(&1, elicitation_id))}
+     socket
+     |> assign(:runtime_status, resumed_runtime_status(socket))
+     |> update(:pending_mcp_elicitations, &remove_mcp_elicitation(&1, elicitation_id))}
   end
 
   @impl true
@@ -2174,24 +2706,50 @@ defmodule Sigma.Web.SessionLive do
       socket
       |> stream_insert(:messages, message)
       |> assign(:tool_call_to_msg, new_tc_map)
-      |> assign_context_token_count(message)
 
     {:noreply, socket}
   end
 
   @impl true
   def handle_info({:message_end, %{role: :assistant} = message}, socket) do
-    socket =
-      socket
-      |> stream_insert(:messages, message)
-      |> assign_context_token_count(message)
-
-    {:noreply, socket}
+    {:noreply, stream_insert(socket, :messages, message)}
   end
 
   @impl true
   def handle_info({:message_end, message}, socket) do
     {:noreply, stream_insert(socket, :messages, message)}
+  end
+
+  @impl true
+  def handle_info({:metrics, fact, attrs}, socket) when is_map(attrs) do
+    metrics_state =
+      case socket.assigns[:session_metrics_state] do
+        %Sigma.Session.Metrics{} = state ->
+          ensure_metrics_session(state, socket.assigns[:session_id])
+
+        _ ->
+          Sigma.Session.Metrics.new(socket.assigns[:session_id])
+      end
+
+    metrics_state = Sigma.Session.Metrics.reduce(metrics_state, {fact, attrs})
+    runtime_status = metrics_runtime_status(fact, attrs, socket)
+
+    socket =
+      socket
+      |> assign(:session_metrics_state, metrics_state)
+      |> assign(:session_metrics, Sigma.Session.Metrics.snapshot(metrics_state))
+      |> assign(:runtime_status, runtime_status)
+
+    socket =
+      if fact in [:request_finished, :request_usage, :turn_finished, :compaction] and
+           is_pid(socket.assigns.agent) do
+        agent = socket.assigns.agent
+        start_async(socket, :agent_status, fn -> Sigma.Agent.status(agent) end)
+      else
+        socket
+      end
+
+    {:noreply, socket}
   end
 
   @impl true
@@ -2257,25 +2815,59 @@ defmodule Sigma.Web.SessionLive do
     {:noreply, socket}
   end
 
-  defp do_fork(socket, mode) do
-    message_id =
-      case mode do
-        :all -> :all
-        {:at, msg_id} -> msg_id
-      end
+  defp prepare_fork(socket, source_session_id, mode) do
+    message_id = if mode == :all, do: :all, else: elem(mode, 1)
 
-    {:noreply,
-     handle_fork_result(socket, fork_with_new_id(socket, socket.assigns.session_id, message_id))}
+    cond do
+      not session_ready?(socket) ->
+        {:noreply, put_flash(socket, :info, "Session is still loading.")}
+
+      socket.assigns.turn_in_flight ->
+        {:noreply, put_flash(socket, :info, "Wait for the active turn to finish before forking.")}
+
+      true ->
+        with {:ok, source_path} <-
+               Sigma.Session.SessionFiles.jsonl_path(
+                 socket.assigns.sessions_dir,
+                 source_session_id
+               ),
+             {:ok, snapshot} <- Sigma.Session.Log.snapshot(source_path) do
+          boundary_turn_id = fork_boundary_turn_id(snapshot.messages, message_id)
+
+          pending = %{
+            source_session_id: source_session_id,
+            message_id: message_id,
+            boundary_turn_id: boundary_turn_id,
+            target_title: "Fork of #{source_session_id}",
+            provider_id: snapshot.provider_id,
+            model_id: snapshot.model_id,
+            cwd: snapshot.cwd || socket.assigns.workdir,
+            operation_id: new_operation_id("fork"),
+            expected_source_revision:
+              length(snapshot.branch_entry_ids) + if(is_map(snapshot.header), do: 1, else: 0),
+            expected_source_leaf: snapshot.active_leaf_id
+          }
+
+          {:noreply, assign(socket, :pending_fork, pending)}
+        else
+          {:error, reason} ->
+            {:noreply, put_flash(socket, :error, fork_error_message(reason))}
+        end
+    end
   end
 
-  defp fork_with_new_id(socket, source_id, message_id) do
-    fork_with_new_id(socket, source_id, message_id, @fork_id_attempts)
+  defp fork_with_new_id(socket, source_id, message_id, opts) do
+    fork_with_new_id(socket, source_id, message_id, opts, @fork_id_attempts)
   end
 
-  defp fork_with_new_id(_socket, _source_id, _message_id, 0), do: {:error, :already_exists}
+  defp fork_with_new_id(_socket, _source_id, _message_id, _opts, 0),
+    do: {:error, :already_exists}
 
-  defp fork_with_new_id(socket, source_id, message_id, attempts_left) do
+  defp fork_with_new_id(socket, source_id, message_id, opts, attempts_left) do
     new_id = new_fork_id()
+    checkpoint_opts = if opts == [], do: fork_checkpoint_opts(socket, source_id), else: opts
+    operation_id = Keyword.get(checkpoint_opts, :operation_id, "fork-#{source_id}")
+    attempt_opts = Keyword.put(checkpoint_opts, :operation_id, "#{operation_id}-target-#{new_id}")
 
     case Sigma.Agent.Runtime.fork_session(
            socket.assigns.workdir,
@@ -2283,16 +2875,33 @@ defmodule Sigma.Web.SessionLive do
            new_id,
            socket.assigns.sessions_dir,
            message_id,
-           fallback_cwd: socket.assigns.workdir
+           Keyword.merge(
+             [fallback_cwd: socket.assigns.workdir],
+             attempt_opts
+           )
          ) do
       {:ok, %{session_id: ^new_id}} ->
         {:ok, new_id}
 
       {:error, :already_exists} ->
-        fork_with_new_id(socket, source_id, message_id, attempts_left - 1)
+        fork_with_new_id(socket, source_id, message_id, opts, attempts_left - 1)
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp fork_checkpoint_opts(socket, source_id) do
+    with {:ok, source_path} <-
+           Sigma.Session.SessionFiles.jsonl_path(socket.assigns.sessions_dir, source_id),
+         {:ok, snapshot} <- Sigma.Session.Log.snapshot(source_path) do
+      [
+        expected_source_revision:
+          length(snapshot.branch_entry_ids) + if(is_map(snapshot.header), do: 1, else: 0),
+        expected_source_leaf: snapshot.active_leaf_id
+      ]
+    else
+      _ -> []
     end
   end
 
@@ -2306,6 +2915,42 @@ defmodule Sigma.Web.SessionLive do
     end
   end
 
+  defp new_operation_id(prefix) do
+    suffix = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
+    "#{prefix}-#{suffix}"
+  end
+
+  defp retry_error_message(:message_not_found),
+    do: "The original prompt is no longer available."
+
+  defp retry_error_message(:missing_retry_history),
+    do: "This legacy turn has no retry checkpoint. Use Resend or Fork instead."
+
+  defp retry_error_message(:retry_attachments_unavailable),
+    do: "The original attachments are no longer available. Use Resend or Fork instead."
+
+  defp retry_error_message(:session_busy),
+    do: "Wait for the active turn to finish before retrying."
+
+  defp retry_error_message({:revision_conflict, _details}),
+    do: "The session changed before retrying. Refresh and choose Retry again."
+
+  defp retry_error_message({:leaf_conflict, _details}),
+    do: "The conversation branch changed before retrying. Refresh and choose Retry again."
+
+  defp retry_error_message(_reason), do: "Unable to retry from that checkpoint."
+
+  defp fork_error_message(:invalid_fork_boundary),
+    do: "Choose a completed turn boundary before forking."
+
+  defp fork_error_message(:unpaired_tool_exchange),
+    do: "That boundary splits a tool call from its result. Choose a completed turn instead."
+
+  defp fork_error_message(:message_not_found),
+    do: "The selected fork boundary is no longer available."
+
+  defp fork_error_message(_reason), do: "Unable to prepare that fork."
+
   defp handle_fork_result(socket, {:ok, new_id}) do
     push_navigate(socket,
       to: ~p"/repository/#{socket.assigns.encoded_repository}/sessions/#{new_id}"
@@ -2318,6 +2963,22 @@ defmodule Sigma.Web.SessionLive do
 
   defp handle_fork_result(socket, {:error, :session_busy}) do
     put_flash(socket, :error, "Wait for the active turn to finish before forking this session.")
+  end
+
+  defp handle_fork_result(socket, {:error, {:revision_conflict, _details}}) do
+    put_flash(
+      socket,
+      :error,
+      "The session changed before forking. Refresh and choose Fork again."
+    )
+  end
+
+  defp handle_fork_result(socket, {:error, {:leaf_conflict, _details}}) do
+    put_flash(
+      socket,
+      :error,
+      "The conversation branch changed before forking. Refresh and try again."
+    )
   end
 
   defp handle_fork_result(socket, {:error, _reason}) do
@@ -2354,12 +3015,23 @@ defmodule Sigma.Web.SessionLive do
     |> assign(:tool_call_to_msg, %{})
     |> assign(:sessions, [])
     |> assign(:renaming_session, nil)
+    |> assign(:pending_retry, nil)
+    |> assign(:pending_fork, nil)
+    |> assign(:pending_compaction, false)
+    |> assign(:parent_session_id, nil)
+    |> assign(:runtime_status, :loading)
     |> assign(:active_provider_id, nil)
     |> assign(:current_model, nil)
     |> assign(:current_model_value, nil)
     |> assign(:model_options, [])
-    |> assign(:context_token_count, 0)
+    |> assign(:context_token_count, nil)
     |> assign(:context_window, nil)
+    |> assign(:context_snapshot, nil)
+    |> assign(:current_request_id, nil)
+    |> assign(:branch_summaries, [])
+    |> assign(:session_metrics, %{})
+    |> assign(:session_metrics_state, Sigma.Session.Metrics.new(session_id))
+    |> assign(:context_policy, %{})
     |> assign(:context_diagnostics, [])
     |> assign(:context_trace, [])
     |> assign(:pending_user_questions, [])
@@ -2367,6 +3039,7 @@ defmodule Sigma.Web.SessionLive do
     |> assign(:logs_available, true)
     |> assign(:mcp_server_ids, [])
     |> assign(:show_logs, false)
+    |> assign(:show_observability, false)
     |> assign(:log_entries, [])
     |> assign(:log_filter, nil)
     |> assign(:log_search, "")
@@ -2377,6 +3050,124 @@ defmodule Sigma.Web.SessionLive do
     |> assign(:session_ready, false)
     |> assign(:session_load, AsyncResult.loading())
   end
+
+  defp session_observability_snapshot(assigns) do
+    status =
+      cond do
+        not assigns[:session_ready] -> :loading
+        true -> assigns[:runtime_status] || :idle
+      end
+
+    (assigns[:session_metrics] || %{})
+    |> Map.put(:status, status)
+    |> Map.put(:model, assigns[:current_model])
+    |> Map.put(:context, assigns[:context_token_count])
+    |> Map.put(:parent_session_id, assigns[:parent_session_id])
+    |> Map.put(:parent_path, parent_session_path(assigns))
+    |> Map.put(:current_request, current_request(assigns))
+  end
+
+  defp load_branch_summaries(%{header: header}, storage_path) when is_map(header) do
+    case Sigma.Session.Log.branch_summaries(storage_path) do
+      {:ok, summaries} -> summaries
+      {:error, _reason} -> []
+    end
+  end
+
+  defp load_branch_summaries(_snapshot, _storage_path), do: []
+
+  defp context_budget_view(assigns) do
+    snapshot = assigns[:context_snapshot]
+
+    (assigns[:context_policy] || %{})
+    |> Map.put(:estimate, snapshot && snapshot.next_request_estimated_input_tokens)
+    |> Map.put(:last_measured, snapshot && snapshot.last_request_input_tokens)
+    |> Map.put(:estimate_source, snapshot && snapshot.source)
+    |> Map.put(:measurement_source, snapshot && snapshot.last_measurement_source)
+    |> Map.put(:context_revision, snapshot && snapshot.context_revision)
+    |> Map.put(:active_leaf, snapshot && snapshot.active_leaf)
+    |> Map.put(:model, snapshot && snapshot.model)
+    |> Map.put(:generated_at, snapshot && snapshot.generated_at)
+  end
+
+  defp apply_agent_status(socket, status) do
+    context_snapshot = status[:context_snapshot]
+    context_policy = status[:context_policy] || %{}
+
+    assign(socket,
+      runtime_status: status.phase,
+      turn_in_flight: active_runtime_phase?(status.phase),
+      context_snapshot: context_snapshot,
+      current_request_id: status[:current_request_id],
+      context_policy: context_policy,
+      context_token_count: context_display_tokens(context_snapshot),
+      context_window: context_policy[:context_window]
+    )
+  end
+
+  defp context_display_tokens(%{next_request_estimated_input_tokens: estimate})
+       when is_integer(estimate),
+       do: estimate
+
+  defp context_display_tokens(%{last_request_input_tokens: measured}) when is_integer(measured),
+    do: measured
+
+  defp context_display_tokens(_snapshot), do: nil
+
+  defp runtime_phase(phase, _fallback) when is_atom(phase), do: phase
+  defp runtime_phase(_phase, fallback), do: fallback
+
+  defp current_request(assigns) do
+    requests = get_in(assigns, [:session_metrics, :requests]) || %{}
+    Map.get(requests, assigns[:current_request_id])
+  end
+
+  defp parent_session_path(%{parent_session_id: parent_id, encoded_repository: repository})
+       when is_binary(parent_id),
+       do: "/repository/#{repository}/sessions/#{URI.encode(parent_id)}"
+
+  defp parent_session_path(_assigns), do: nil
+
+  defp active_runtime_phase?(phase),
+    do:
+      phase in [
+        :streaming_provider,
+        :running_tools,
+        :waiting_permission,
+        :waiting_elicitation,
+        :cancelling,
+        :session_operation,
+        :compacting
+      ]
+
+  defp session_process_runtime_status(:turn_running), do: :streaming_provider
+  defp session_process_runtime_status(:starting), do: :loading
+  defp session_process_runtime_status(:stopped), do: :interrupted
+  defp session_process_runtime_status(_status), do: :idle
+
+  defp resumed_runtime_status(socket) do
+    if socket.assigns.turn_in_flight, do: :running_tools, else: :idle
+  end
+
+  defp metrics_runtime_status(:compaction, attrs, socket) do
+    case attrs[:status] || attrs["status"] do
+      status when status in [:started, "started"] -> :compacting
+      _terminal -> resumed_runtime_status(socket)
+    end
+  end
+
+  defp metrics_runtime_status(_fact, _attrs, socket), do: socket.assigns.runtime_status
+
+  defp compact_error_message(:session_busy),
+    do: "The session became busy before compaction started."
+
+  defp compact_error_message(:session_not_running),
+    do: "The session is not available for compaction."
+
+  defp compact_error_message(reason), do: "Compaction failed: #{inspect(reason)}"
+
+  defp ensure_metrics_session(%Sigma.Session.Metrics{} = state, session_id),
+    do: %{state | session_id: session_id}
 
   defp session_event_handler(repo_key, session_id) do
     fn event ->
@@ -2549,7 +3340,11 @@ defmodule Sigma.Web.SessionLive do
   defp slash_commands(cwd) do
     builtins = [
       %{value: "/init", label: "/init", description: "Create or update AGENTS.md"},
-      %{value: "/reload-tools", label: "/reload-tools", description: "Reconnect MCP servers and refresh their tools"}
+      %{
+        value: "/reload-tools",
+        label: "/reload-tools",
+        description: "Reconnect MCP servers and refresh their tools"
+      }
     ]
 
     skills =
